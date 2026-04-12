@@ -1,0 +1,62 @@
+version: '3.8'
+
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    container_name: trading-backend
+    ports:
+      - "8000:8000"
+    environment:
+      - DEBUG=False
+      - LOG_LEVEL=INFO
+      - GROWW_API_KEY=${GROWW_API_KEY:-}
+      - LIVE_TRADING_ENABLED=False
+      - PAPER_TRADING_INITIAL_CAPITAL=1000000
+    volumes:
+      - trading-db:/app
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 5s
+    networks:
+      - trading-network
+
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+    container_name: trading-frontend
+    ports:
+      - "3000:3000"
+    environment:
+      - REACT_APP_API_URL=http://localhost:8000
+    depends_on:
+      - backend
+    networks:
+      - trading-network
+
+  # Optional: PostgreSQL for production
+  # postgres:
+  #   image: postgres:15-alpine
+  #   container_name: trading-db
+  #   environment:
+  #     - POSTGRES_PASSWORD=tradingdb123
+  #     - POSTGRES_DB=trading
+  #   volumes:
+  #     - postgres-data:/var/lib/postgresql/data
+  #   ports:
+  #     - "5432:5432"
+  #   networks:
+  #     - trading-network
+
+volumes:
+  trading-db:
+  # postgres-data:
+
+networks:
+  trading-network:
+    driver: bridge

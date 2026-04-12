@@ -1,0 +1,28 @@
+# Node.js dependencies
+node_modules/
+
+# Python virtual environment
+venv/
+
+# Environment variables
+.env
+
+# SQLite database
+*.db
+
+# Logs
+*.log
+
+# Compiled files
+*.pyc
+__pycache__/
+
+# Frontend build artifacts
+build/
+
+# IDE settings
+.vscode/
+.idea/
+
+# MacOS system files
+.DS_Store
