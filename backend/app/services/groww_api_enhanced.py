@@ -1,462 +1,557 @@
 """
-Enhanced Groww API Client for real market data integration
+GrowwService – high-level service layer built on top of GrowwAPIClient.
+
+This module handles:
+  - Client initialisation from config (token exchange)
+  - Normalising SDK responses for the rest of the app
+  - Providing helper utilities (date helpers, candle → list normalisation)
+
+All Groww API interactions in the rest of the app should go through
+GrowwService rather than calling GrowwAPIClient directly.
 """
-import aiohttp
 import logging
-from typing import Dict, List, Optional, Tuple
 from datetime import datetime, timedelta
-import json
+from typing import Any, Dict, List, Optional
+
+from growwapi import GrowwAPI
+
 from app.core.config import settings
+from app.services.groww_api import GrowwAPIClient
 
 logger = logging.getLogger(__name__)
 
-class GrowwAPIClient:
-    """Real-time Groww API integration"""
-    
+# ---------------------------------------------------------------------------
+# Module-level singleton
+# ---------------------------------------------------------------------------
+_groww_service: Optional["GrowwService"] = None
+
+
+async def get_groww_service() -> "GrowwService":
+    """Return (and lazily initialise) the module-level GrowwService."""
+    global _groww_service
+    if _groww_service is None:
+        _groww_service = GrowwService()
+        await _groww_service.initialise()
+    return _groww_service
+
+
+# ---------------------------------------------------------------------------
+# Service class
+# ---------------------------------------------------------------------------
+class GrowwService:
+    """
+    High-level async service wrapping GrowwAPIClient.
+
+    Initialisation
+    --------------
+    The Groww SDK requires a bearer *access token* (not the raw API key).
+    Call ``initialise()`` once at startup to exchange the API key for a token
+    and build the underlying client.
+
+    If no API key is configured the service runs in *offline mode* – all
+    data methods return ``None`` and the rest of the app falls back to
+    paper-trading / mock data.
+    """
+
     def __init__(self):
-        self.base_url = settings.GROWW_API_BASE_URL
-        self.api_key = settings.GROWW_API_KEY
-        self.api_secret = settings.GROWW_API_SECRET
-        self.auth_token = settings.GROWW_AUTH_TOKEN
-        self.session = None
-        
-    async def initialize(self):
-        """Initialize HTTP session"""
-        self.session = aiohttp.ClientSession()
-    
-    async def close(self):
-        """Close HTTP session"""
-        if self.session:
-            await self.session.close()
-    
-    def _get_headers(self) -> Dict:
-        """Get authorization headers"""
-        return {
-            "Authorization": f"Bearer {self.auth_token}",
-            "X-API-Key": self.api_key,
-            "Content-Type": "application/json"
-        }
-    
-    # ============ MARKET DATA ============
-    
-    async def get_stock_quote(self, symbol: str) -> Optional[Dict]:
+        self.client: Optional[GrowwAPIClient] = None
+        self._online = False
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+    async def initialise(self):
         """
-        Fetch real-time quote for a stock
-        
-        Returns: {
-            "symbol": "NSE.RELIANCE",
-            "name": "RELIANCE INDUSTRIES LIMITED",
-            "price": 2850.50,
-            "change": 25.50,
-            "change_percent": 0.90,
-            "bid": 2850.00,
-            "ask": 2851.00,
-            "volume": 5000000,
-            "market_cap": 2500000000000,
-            "52_week_high": 3500.00,
-            "52_week_low": 2200.00,
-            "pe_ratio": 25.5,
-            "dividend_yield": 2.1,
-            "timestamp": "2026-04-12T14:30:00Z"
-        }
+        Exchange the API key for an access token and build the SDK client.
+        Safe to call even when no credentials are configured.
         """
-        try:
-            if not self.session:
-                await self.initialize()
-            
-            url = f"{self.base_url}/quote/{symbol}"
-            async with self.session.get(url, headers=self._get_headers()) as response:
-                if response.status == 200:
-                    data = await response.json()
-                    logger.info(f"Fetched quote for {symbol}: ₹{data.get('price')}")
-                    return data
-                else:
-                    logger.warning(f"Failed to fetch quote for {symbol}: {response.status}")
-                    return None
-        except Exception as e:
-            logger.error(f"Error fetching quote for {symbol}: {e}")
+        api_key = settings.GROWW_API_KEY
+        if not api_key:
+            logger.warning(
+                "GROWW_API_KEY not set – Groww service running in offline mode."
+            )
+            return
+
+        # If a pre-issued auth token is present in config use it directly,
+        # otherwise obtain one via the SDK's get_access_token flow.
+        token = getattr(settings, "GROWW_AUTH_TOKEN", "") or ""
+        if not token:
+            logger.info("Fetching Groww access token via API key …")
+            token = GrowwAPIClient.get_access_token(api_key)
+
+        if not token:
+            logger.error(
+                "Could not obtain Groww access token – service running in offline mode."
+            )
+            return
+
+        self.client = GrowwAPIClient(token)
+        self._online = True
+        logger.info("GrowwService initialised and online.")
+
+    @property
+    def is_online(self) -> bool:
+        return self._online and self.client is not None
+
+    # ------------------------------------------------------------------
+    # User / account
+    # ------------------------------------------------------------------
+    async def get_user_profile(self) -> Optional[Dict]:
+        """Return the authenticated user's profile from Groww."""
+        if not self.is_online:
             return None
-    
-    async def get_historical_data(
-        self, 
-        symbol: str, 
+        return await self.client.get_user_profile()
+
+    async def get_available_margin(self) -> Optional[Dict]:
+        """Return available margin details."""
+        if not self.is_online:
+            return None
+        return await self.client.get_available_margin()
+
+    # ------------------------------------------------------------------
+    # Instruments
+    # ------------------------------------------------------------------
+    async def get_all_instruments(self) -> Optional[List[Dict]]:
+        """
+        Download the full Groww instrument master (equity + F&O).
+
+        The SDK caches the CSV after the first download.
+        """
+        if not self.is_online:
+            return None
+        return await self.client.get_all_instruments()
+
+    async def get_instrument(
+        self, trading_symbol: str, exchange: str = GrowwAPI.EXCHANGE_NSE
+    ) -> Optional[Dict]:
+        """
+        Look up an instrument by exchange + trading symbol.
+
+        Args:
+            trading_symbol: e.g. "RELIANCE"
+            exchange:        GrowwAPI.EXCHANGE_NSE (default) | EXCHANGE_BSE
+        """
+        if not self.is_online:
+            return None
+        return await self.client.get_instrument_by_exchange_and_trading_symbol(
+            exchange, trading_symbol
+        )
+
+    async def get_instrument_by_groww_symbol(self, groww_symbol: str) -> Optional[Dict]:
+        """Look up an instrument by its Groww symbol string."""
+        if not self.is_online:
+            return None
+        return await self.client.get_instrument_by_groww_symbol(groww_symbol)
+
+    # ------------------------------------------------------------------
+    # Market data
+    # ------------------------------------------------------------------
+    async def get_ltp(
+        self,
+        trading_symbol: str,
+        exchange: str = GrowwAPI.EXCHANGE_NSE,
+        segment: str = GrowwAPI.SEGMENT_CASH,
+    ) -> Optional[float]:
+        """
+        Return the last traded price for a single symbol.
+
+        Args:
+            trading_symbol: e.g. "RELIANCE"
+            exchange:        GrowwAPI.EXCHANGE_NSE | EXCHANGE_BSE
+            segment:         GrowwAPI.SEGMENT_CASH | SEGMENT_FNO
+        """
+        if not self.is_online:
+            return None
+        key = f"{exchange}:{trading_symbol}"
+        result = await self.client.get_ltp((key,), segment)
+        if result:
+            # SDK returns a dict keyed by the exchange:symbol string
+            entry = result.get(key) or next(iter(result.values()), {})
+            return entry.get("ltp") or entry.get("last_price")
+        return None
+
+    async def get_quote(
+        self,
+        trading_symbol: str,
+        exchange: str = GrowwAPI.EXCHANGE_NSE,
+        segment: str = GrowwAPI.SEGMENT_CASH,
+    ) -> Optional[Dict]:
+        """
+        Return the full market quote for a symbol.
+
+        Args:
+            trading_symbol: e.g. "RELIANCE"
+            exchange:        GrowwAPI.EXCHANGE_NSE | EXCHANGE_BSE
+            segment:         GrowwAPI.SEGMENT_CASH | SEGMENT_FNO
+        """
+        if not self.is_online:
+            return None
+        return await self.client.get_quote(trading_symbol, exchange, segment)
+
+    async def get_ohlc(
+        self,
+        trading_symbol: str,
+        exchange: str = GrowwAPI.EXCHANGE_NSE,
+        segment: str = GrowwAPI.SEGMENT_CASH,
+    ) -> Optional[Dict]:
+        """
+        Return OHLC data for a symbol.
+
+        Args:
+            trading_symbol: e.g. "RELIANCE"
+            exchange:        GrowwAPI.EXCHANGE_NSE | EXCHANGE_BSE
+            segment:         GrowwAPI.SEGMENT_CASH | SEGMENT_FNO
+        """
+        if not self.is_online:
+            return None
+        key = f"{exchange}:{trading_symbol}"
+        result = await self.client.get_ohlc((key,), segment)
+        if result:
+            return result.get(key) or next(iter(result.values()), None)
+        return None
+
+    # ------------------------------------------------------------------
+    # Historical candles
+    # ------------------------------------------------------------------
+
+    # Map human-readable interval names → minutes
+    _INTERVAL_MAP = {
+        "1minute": 1, "1min": 1,
+        "5minute": 5, "5min": 5,
+        "15minute": 15, "15min": 15,
+        "30minute": 30, "30min": 30,
+        "1hour": 60, "1hr": 60,
+        "4hour": 240, "4hr": 240,
+        "1day": 1440, "day": 1440,
+        "1week": 10080, "week": 10080,
+    }
+
+    async def get_historical_candles(
+        self,
+        trading_symbol: str,
+        interval: str = "1day",
         days: int = 365,
-        interval: str = "1d"
+        exchange: str = GrowwAPI.EXCHANGE_NSE,
+        segment: str = GrowwAPI.SEGMENT_CASH,
     ) -> Optional[List[Dict]]:
         """
-        Fetch historical OHLCV data
-        
+        Fetch historical OHLCV candles using the correct Groww SDK method.
+
+        The SDK expects ``start_time`` / ``end_time`` as
+        ``"yyyy-MM-dd HH:mm:ss"`` strings and ``interval_in_minutes`` as int.
+
         Args:
-            symbol: Stock symbol (e.g., "NSE.RELIANCE")
-            days: Number of days of historical data (1-365)
-            interval: "1m", "5m", "15m", "1h", "1d"
-        
-        Returns: List of {
-            "timestamp": "2026-04-12T00:00:00Z",
-            "open": 2825.00,
-            "high": 2850.50,
-            "low": 2820.00,
-            "close": 2850.00,
-            "volume": 5000000,
-            "vwap": 2836.25
-        }
+            trading_symbol: e.g. "RELIANCE"
+            interval:        "1minute","5minute","15minute","30minute",
+                             "1hour","4hour","1day" (default),"1week"
+            days:            How many calendar days of history (max ~365)
+            exchange:        GrowwAPI.EXCHANGE_NSE | EXCHANGE_BSE
+            segment:         GrowwAPI.SEGMENT_CASH | SEGMENT_FNO
+
+        Returns:
+            List of dicts: [{timestamp, open, high, low, close, volume}, ...]
+            Returns None if offline or on error.
         """
-        try:
-            if not self.session:
-                await self.initialize()
-            
-            params = {
-                "interval": interval,
-                "days": min(days, 365)  # Max 365 days
-            }
-            
-            url = f"{self.base_url}/historical/{symbol}"
-            async with self.session.get(url, params=params, headers=self._get_headers()) as response:
-                if response.status == 200:
-                    data = await response.json()
-                    logger.info(f"Fetched {len(data)} candles for {symbol}")
-                    return data
-                else:
-                    logger.warning(f"Failed to fetch historical data: {response.status}")
-                    return None
-        except Exception as e:
-            logger.error(f"Error fetching historical data for {symbol}: {e}")
+        if not self.is_online:
             return None
-    
-    async def get_intraday_data(
-        self, 
-        symbol: str, 
-        minutes: int = 1
-    ) -> Optional[List[Dict]]:
+
+        # Resolve interval string → minutes
+        interval_mins = self._INTERVAL_MAP.get(interval.lower(), 1440)
+
+        # Build start/end in "yyyy-MM-dd HH:mm:ss" format
+        end_dt = datetime.today()
+        start_dt = end_dt - timedelta(days=min(days, 365))
+        end_time = end_dt.strftime("%Y-%m-%d %H:%M:%S")
+        start_time = start_dt.strftime("%Y-%m-%d %H:%M:%S")
+
+        raw = await self.client.get_historical_candle_data_v2(
+            trading_symbol=trading_symbol,
+            exchange=exchange,
+            segment=segment,
+            start_time=start_time,
+            end_time=end_time,
+            interval_in_minutes=interval_mins,
+        )
+        return self._normalise_candles(raw)
+
+    def _normalise_candles(self, raw: Any) -> Optional[List[Dict]]:
         """
-        Fetch intraday minute data
-        
+        Convert SDK candle output (DataFrame or list) to list of plain dicts.
+        """
+        if raw is None:
+            return None
+        # pandas DataFrame
+        if hasattr(raw, "to_dict"):
+            return raw.to_dict(orient="records")
+        # Already a list
+        if isinstance(raw, list):
+            return raw
+        logger.warning(f"Unexpected candle data type: {type(raw)}")
+        return None
+
+    # ------------------------------------------------------------------
+    # Portfolio
+    # ------------------------------------------------------------------
+    async def get_holdings(self) -> Optional[Dict]:
+        """
+        Fetch long-term delivery holdings (CNC positions).
+
+        Returns raw SDK response dict (keys depend on SDK version).
+        """
+        if not self.is_online:
+            return None
+        return await self.client.get_holdings()
+
+    async def get_positions(
+        self, segment: Optional[str] = None
+    ) -> Optional[Dict]:
+        """
+        Fetch intraday / F&O open positions.
+
         Args:
-            symbol: Stock symbol
-            minutes: Minutes interval (1, 5, 15, 30, 60)
+            segment: Optional – GrowwAPI.SEGMENT_CASH | SEGMENT_FNO | etc.
         """
-        return await self.get_historical_data(symbol, days=1, interval=f"{minutes}m")
-    
-    # ============ OPTIONS DATA ============
-    
-    async def get_options_chain(self, symbol: str) -> Optional[List[Dict]]:
-        """
-        Fetch options chain for a stock
-        
-        Returns: List of {
-            "symbol": "RELIANCE",
-            "strike": 2850,
-            "expiry": "2026-04-16",
-            "call": {
-                "symbol": "RELIANCE_CE_2850",
-                "bid": 45.50,
-                "ask": 46.00,
-                "last_price": 45.75,
-                "volume": 1000000,
-                "open_interest": 500000,
-                "iv": 25.5,
-                "delta": 0.65,
-                "gamma": 0.002,
-                "theta": -0.15,
-                "vega": 0.45
-            },
-            "put": {
-                "symbol": "RELIANCE_PE_2850",
-                ...
-            }
-        }
-        """
-        try:
-            if not self.session:
-                await self.initialize()
-            
-            url = f"{self.base_url}/options/chain/{symbol}"
-            async with self.session.get(url, headers=self._get_headers()) as response:
-                if response.status == 200:
-                    data = await response.json()
-                    logger.info(f"Fetched options chain for {symbol}: {len(data)} strikes")
-                    return data
-                else:
-                    logger.warning(f"Failed to fetch options chain: {response.status}")
-                    return None
-        except Exception as e:
-            logger.error(f"Error fetching options chain for {symbol}: {e}")
+        if not self.is_online:
             return None
-    
-    async def get_options_greeks(self, symbol: str, strike: float, expiry: str) -> Optional[Dict]:
-        """
-        Get Greeks (delta, gamma, theta, vega) for an option
-        """
-        try:
-            if not self.session:
-                await self.initialize()
-            
-            url = f"{self.base_url}/options/greeks"
-            params = {
-                "symbol": symbol,
-                "strike": strike,
-                "expiry": expiry
-            }
-            
-            async with self.session.get(url, params=params, headers=self._get_headers()) as response:
-                if response.status == 200:
-                    return await response.json()
-                else:
-                    logger.warning("Failed to fetch Greeks")
-                    return None
-        except Exception as e:
-            logger.error(f"Error fetching Greeks: {e}")
+        return await self.client.get_positions(segment)
+
+    async def get_position_for_symbol(
+        self,
+        trading_symbol: str,
+        segment: str = GrowwAPI.SEGMENT_CASH,
+    ) -> Optional[Dict]:
+        """Return position details for a single trading symbol."""
+        if not self.is_online:
             return None
-    
-    # ============ MUTUAL FUNDS ============
-    
-    async def get_mutual_funds(self) -> Optional[List[Dict]]:
-        """
-        Fetch all available mutual funds with ratings and returns
-        
-        Returns: List of {
-            "fund_code": "AXISBLUEQ",
-            "fund_name": "Axis Bluechip Fund",
-            "category": "Large Cap",
-            "nav": 145.50,
-            "aum": 50000000000,
-            "expense_ratio": 0.58,
-            "risk_rating": 3,  # 1-5 stars
-            "returns_1y": 12.5,
-            "returns_3y": 14.2,
-            "returns_5y": 15.8,
-            "rating": 5,  # Fund rating
-            "last_updated": "2026-04-12T15:30:00Z"
-        }
-        """
-        try:
-            if not self.session:
-                await self.initialize()
-            
-            url = f"{self.base_url}/mutual-funds"
-            async with self.session.get(url, headers=self._get_headers()) as response:
-                if response.status == 200:
-                    data = await response.json()
-                    logger.info(f"Fetched {len(data)} mutual funds")
-                    return data
-                else:
-                    logger.warning(f"Failed to fetch mutual funds: {response.status}")
-                    return None
-        except Exception as e:
-            logger.error(f"Error fetching mutual funds: {e}")
-            return None
-    
-    async def search_mutual_funds(self, query: str) -> Optional[List[Dict]]:
-        """Search for mutual funds by name or category"""
-        try:
-            if not self.session:
-                await self.initialize()
-            
-            url = f"{self.base_url}/mutual-funds/search"
-            params = {"q": query}
-            
-            async with self.session.get(url, params=params, headers=self._get_headers()) as response:
-                if response.status == 200:
-                    return await response.json()
-                else:
-                    return None
-        except Exception as e:
-            logger.error(f"Error searching mutual funds: {e}")
-            return None
-    
-    # ============ MARKET ANALYSIS ============
-    
-    async def get_trending_stocks(self, limit: int = 10) -> Optional[List[Dict]]:
-        """
-        Get trending stocks by volume and momentum
-        
-        Returns: List of {
-            "symbol": "NSE.RELIANCE",
-            "name": "RELIANCE INDUSTRIES",
-            "price": 2850.50,
-            "change_percent": 2.5,
-            "volume": 5000000,
-            "trend_strength": 0.85,
-            "reason": "Volume breakout, bullish setup"
-        }
-        """
-        try:
-            if not self.session:
-                await self.initialize()
-            
-            url = f"{self.base_url}/trends/stocks"
-            params = {"limit": limit}
-            
-            async with self.session.get(url, params=params, headers=self._get_headers()) as response:
-                if response.status == 200:
-                    return await response.json()
-                else:
-                    return None
-        except Exception as e:
-            logger.error(f"Error fetching trending stocks: {e}")
-            return None
-    
-    async def get_market_breadth(self) -> Optional[Dict]:
-        """
-        Get market breadth data (advances, declines, etc.)
-        
-        Returns: {
-            "advances": 1500,
-            "declines": 800,
-            "unchanged": 200,
-            "advance_decline_ratio": 1.875,
-            "market_sentiment": "BULLISH",
-            "vix": 15.5
-        }
-        """
-        try:
-            if not self.session:
-                await self.initialize()
-            
-            url = f"{self.base_url}/market/breadth"
-            async with self.session.get(url, headers=self._get_headers()) as response:
-                if response.status == 200:
-                    return await response.json()
-                else:
-                    return None
-        except Exception as e:
-            logger.error(f"Error fetching market breadth: {e}")
-            return None
-    
-    # ============ PORTFOLIO & EXECUTION ============
-    
-    async def get_portfolio(self) -> Optional[Dict]:
-        """Get current portfolio holdings and cash"""
-        try:
-            if not self.session:
-                await self.initialize()
-            
-            url = f"{self.base_url}/portfolio"
-            async with self.session.get(url, headers=self._get_headers()) as response:
-                if response.status == 200:
-                    return await response.json()
-                else:
-                    return None
-        except Exception as e:
-            logger.error(f"Error fetching portfolio: {e}")
-            return None
-    
+        return await self.client.get_position_for_symbol(trading_symbol, segment)
+
+    # ------------------------------------------------------------------
+    # Orders
+    # ------------------------------------------------------------------
     async def place_order(
         self,
-        symbol: str,
-        action: str,  # BUY/SELL
+        trading_symbol: str,
+        transaction_type: str,
         quantity: int,
-        order_type: str = "MARKET",  # MARKET/LIMIT
-        price: Optional[float] = None
+        order_type: str = GrowwAPI.ORDER_TYPE_MARKET,
+        product: str = GrowwAPI.PRODUCT_CNC,
+        validity: str = GrowwAPI.VALIDITY_DAY,
+        price: float = 0.0,
+        trigger_price: Optional[float] = None,
+        exchange: str = GrowwAPI.EXCHANGE_NSE,
+        segment: str = GrowwAPI.SEGMENT_CASH,
+        order_reference_id: Optional[str] = None,
     ) -> Optional[Dict]:
         """
-        Place a stock trading order
-        
-        Returns: {
-            "order_id": "12345",
-            "status": "EXECUTED",
-            "symbol": "NSE.RELIANCE",
-            "action": "BUY",
-            "quantity": 10,
-            "execution_price": 2850.50,
-            "timestamp": "2026-04-12T14:30:00Z"
-        }
-        """
-        try:
-            if not self.session:
-                await self.initialize()
-            
-            # LIVE TRADING ONLY - This requires real Groww integration
-            if not settings.LIVE_TRADING_ENABLED:
-                logger.warning("Live trading is disabled")
-                return None
-            
-            url = f"{self.base_url}/orders/place"
-            payload = {
-                "symbol": symbol,
-                "action": action,
-                "quantity": quantity,
-                "order_type": order_type,
-                "price": price
-            }
-            
-            async with self.session.post(url, json=payload, headers=self._get_headers()) as response:
-                if response.status in (200, 201):
-                    return await response.json()
-                else:
-                    logger.error(f"Order placement failed: {response.status}")
-                    return None
-        except Exception as e:
-            logger.error(f"Error placing order: {e}")
-            return None
-    
-    async def place_options_order(
-        self,
-        contract_symbol: str,
-        action: str,  # BUY/SELL
-        quantity: int,
-        order_type: str = "MARKET",
-        price: Optional[float] = None
-    ) -> Optional[Dict]:
-        """
-        Place an options trading order
-        
+        Place a new order via Groww.
+
+        Live trading must be enabled in settings (``LIVE_TRADING_ENABLED=True``).
+
         Args:
-            contract_symbol: e.g., "RELIANCE_CE_2850" (Call) or "RELIANCE_PE_2850" (Put)
+            trading_symbol:    e.g. "RELIANCE"
+            transaction_type:  GrowwAPI.TRANSACTION_TYPE_BUY | TRANSACTION_TYPE_SELL
+            quantity:          Number of shares / lots
+            order_type:        GrowwAPI.ORDER_TYPE_MARKET (default) | LIMIT | SL | SL_M
+            product:           GrowwAPI.PRODUCT_CNC (default) | MIS | NRML | MTF
+            validity:          GrowwAPI.VALIDITY_DAY (default) | IOC | GTC | GTD | EOS
+            price:             Limit price – required for LIMIT / SL orders; 0.0 for MARKET
+            trigger_price:     Trigger price – required for SL / SL_M orders
+            exchange:          GrowwAPI.EXCHANGE_NSE (default) | EXCHANGE_BSE
+            segment:           GrowwAPI.SEGMENT_CASH (default) | SEGMENT_FNO
+            order_reference_id: Optional client-side idempotency reference
+
+        Returns:
+            SDK response dict with ``groww_order_id`` on success, or None.
         """
-        try:
-            if not self.session:
-                await self.initialize()
-            
-            if not settings.LIVE_TRADING_ENABLED:
-                logger.warning("Live trading is disabled")
-                return None
-            
-            url = f"{self.base_url}/options/place"
-            payload = {
-                "contract_symbol": contract_symbol,
-                "action": action,
-                "quantity": quantity,
-                "order_type": order_type,
-                "price": price
-            }
-            
-            async with self.session.post(url, json=payload, headers=self._get_headers()) as response:
-                if response.status in (200, 201):
-                    return await response.json()
-                else:
-                    logger.error(f"Options order placement failed: {response.status}")
-                    return None
-        except Exception as e:
-            logger.error(f"Error placing options order: {e}")
+        if not self.is_online:
+            logger.warning("place_order: Groww service is offline.")
             return None
-    
-    async def cancel_order(self, order_id: str) -> bool:
-        """Cancel an open order"""
-        try:
-            if not self.session:
-                await self.initialize()
-            
-            url = f"{self.base_url}/orders/{order_id}/cancel"
-            async with self.session.post(url, headers=self._get_headers()) as response:
-                return response.status in (200, 204)
-        except Exception as e:
-            logger.error(f"Error cancelling order: {e}")
-            return False
+        if not settings.LIVE_TRADING_ENABLED:
+            logger.warning("place_order: LIVE_TRADING_ENABLED is False – order blocked.")
+            return None
 
-# Global client instance
-groww_client: Optional[GrowwAPIClient] = None
+        return await self.client.place_order(
+            trading_symbol=trading_symbol,
+            exchange=exchange,
+            segment=segment,
+            transaction_type=transaction_type,
+            quantity=quantity,
+            order_type=order_type,
+            product=product,
+            validity=validity,
+            price=price,
+            trigger_price=trigger_price,
+            order_reference_id=order_reference_id,
+        )
 
-async def get_groww_client() -> GrowwAPIClient:
-    """Get or create Groww API client"""
-    global groww_client
-    if not groww_client:
-        groww_client = GrowwAPIClient()
-        await groww_client.initialize()
-    return groww_client
+    async def cancel_order(
+        self, groww_order_id: str, segment: str = GrowwAPI.SEGMENT_CASH
+    ) -> Optional[Dict]:
+        """Cancel an open order by its Groww order ID."""
+        if not self.is_online:
+            return None
+        return await self.client.cancel_order(segment, groww_order_id)
 
-async def close_groww_client():
-    """Close Groww client"""
-    global groww_client
-    if groww_client:
-        await groww_client.close()
+    async def modify_order(
+        self,
+        groww_order_id: str,
+        order_type: str,
+        quantity: int,
+        price: Optional[float] = None,
+        trigger_price: Optional[float] = None,
+        segment: str = GrowwAPI.SEGMENT_CASH,
+    ) -> Optional[Dict]:
+        """Modify quantity / price of an existing open order."""
+        if not self.is_online:
+            return None
+        return await self.client.modify_order(
+            segment=segment,
+            groww_order_id=groww_order_id,
+            order_type=order_type,
+            quantity=quantity,
+            price=price,
+            trigger_price=trigger_price,
+        )
+
+    async def get_order_list(
+        self,
+        segment: Optional[str] = None,
+        page: int = 0,
+        page_size: int = 25,
+    ) -> Optional[Dict]:
+        """Return the order book (paginated)."""
+        if not self.is_online:
+            return None
+        return await self.client.get_order_list(
+            segment=segment, page=page, page_size=page_size
+        )
+
+    async def get_order_status(
+        self, groww_order_id: str, segment: str = GrowwAPI.SEGMENT_CASH
+    ) -> Optional[Dict]:
+        """Return the status of a specific order."""
+        if not self.is_online:
+            return None
+        return await self.client.get_order_status(segment, groww_order_id)
+
+    async def get_order_margin_details(
+        self, orders: List[Dict], segment: str = GrowwAPI.SEGMENT_CASH
+    ) -> Optional[Dict]:
+        """Calculate the margin required for a set of orders before placing."""
+        if not self.is_online:
+            return None
+        return await self.client.get_order_margin_details(segment, orders)
+
+    # ------------------------------------------------------------------
+    # Options / F&O
+    # ------------------------------------------------------------------
+    async def get_option_chain(
+        self,
+        underlying: str,
+        expiry_date: str,
+        exchange: str = GrowwAPI.EXCHANGE_NSE,
+    ) -> Optional[Dict]:
+        """
+        Fetch the complete options chain for an underlying.
+
+        Args:
+            underlying:   e.g. "NIFTY" or "RELIANCE"
+            expiry_date:  "YYYY-MM-DD"
+            exchange:     GrowwAPI.EXCHANGE_NSE (default)
+        """
+        if not self.is_online:
+            return None
+        return await self.client.get_option_chain(exchange, underlying, expiry_date)
+
+    async def get_expiries(
+        self,
+        underlying_symbol: str,
+        exchange: str = GrowwAPI.EXCHANGE_NSE,
+        year: Optional[int] = None,
+        month: Optional[int] = None,
+    ) -> Optional[Dict]:
+        """
+        Return available expiry dates for an underlying.
+
+        Args:
+            underlying_symbol: e.g. "NIFTY"
+            exchange:           GrowwAPI.EXCHANGE_NSE (default)
+            year:               Optional year filter
+            month:              Optional month filter (1-12)
+        """
+        if not self.is_online:
+            return None
+        return await self.client.get_expiries(exchange, underlying_symbol, year, month)
+
+    async def get_contracts(
+        self,
+        underlying_symbol: str,
+        expiry_date: str,
+        exchange: str = GrowwAPI.EXCHANGE_NSE,
+    ) -> Optional[Dict]:
+        """
+        Fetch all CE + PE contracts for a given underlying and expiry.
+
+        Args:
+            underlying_symbol: e.g. "NIFTY"
+            expiry_date:       "YYYY-MM-DD"
+            exchange:          GrowwAPI.EXCHANGE_NSE (default)
+        """
+        if not self.is_online:
+            return None
+        return await self.client.get_contracts(exchange, underlying_symbol, expiry_date)
+
+    async def get_greeks(
+        self,
+        underlying: str,
+        trading_symbol: str,
+        expiry: str,
+        exchange: str = GrowwAPI.EXCHANGE_NSE,
+    ) -> Optional[Dict]:
+        """
+        Get option Greeks for a specific contract.
+
+        Args:
+            underlying:     e.g. "NIFTY"
+            trading_symbol: e.g. "NIFTY24APR22000CE"
+            expiry:         "YYYY-MM-DD"
+            exchange:       GrowwAPI.EXCHANGE_NSE (default)
+        """
+        if not self.is_online:
+            return None
+        return await self.client.get_greeks(exchange, underlying, trading_symbol, expiry)
+
+    # ------------------------------------------------------------------
+    # Smart orders (GTT / OCO)
+    # ------------------------------------------------------------------
+    async def create_smart_order(self, **kwargs) -> Optional[Dict]:
+        """Create a GTT or OCO smart order. Pass keyword arguments per SDK docs."""
+        if not self.is_online:
+            return None
+        return await self.client.create_smart_order(**kwargs)
+
+    async def cancel_smart_order(
+        self,
+        smart_order_id: str,
+        smart_order_type: str = GrowwAPI.SMART_ORDER_TYPE_GTT,
+        segment: str = GrowwAPI.SEGMENT_CASH,
+    ) -> Optional[Dict]:
+        """Cancel a GTT / OCO smart order."""
+        if not self.is_online:
+            return None
+        return await self.client.cancel_smart_order(segment, smart_order_type, smart_order_id)
+
+    async def get_smart_order_list(
+        self,
+        smart_order_type: Optional[str] = None,
+        segment: Optional[str] = None,
+        status: Optional[str] = None,
+    ) -> Optional[Dict]:
+        """Return a list of smart orders with optional filters."""
+        if not self.is_online:
+            return None
+        return await self.client.get_smart_order_list(
+            smart_order_type=smart_order_type,
+            segment=segment,
+            status=status,
+        )

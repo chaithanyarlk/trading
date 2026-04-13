@@ -11,7 +11,7 @@ from app.models.schemas import (
 )
 from app.services.trading_engine import TradingEngine
 from app.services.paper_trading import PaperTradingSimulator
-from app.services.groww_api import GrowwAPIClient
+from app.services.groww_api_enhanced import GrowwService, get_groww_service
 from app.services.ai_reasoning import AIReasoningEngine
 from app.core.config import settings
 
@@ -19,11 +19,11 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
-# Global instances (would use better state management in production)
+# Global instances
 ai_engine = AIReasoningEngine()
 paper_trader = PaperTradingSimulator(settings.PAPER_TRADING_INITIAL_CAPITAL)
-groww_client = GrowwAPIClient(settings.GROWW_API_KEY, settings.GROWW_API_BASE_URL)
-trading_engine = TradingEngine(groww_client=groww_client)
+groww_service: GrowwService = GrowwService()
+trading_engine = TradingEngine(groww_service=groww_service)
 
 # Store connected websocket clients
 connected_clients: List[WebSocket] = []
@@ -31,13 +31,12 @@ connected_clients: List[WebSocket] = []
 @router.on_event("startup")
 async def startup():
     """Initialize services on startup"""
-    await groww_client.connect()
+    await groww_service.initialise()
     logger.info("Trading system started")
 
 @router.on_event("shutdown")
 async def shutdown():
     """Clean up on shutdown"""
-    await groww_client.disconnect()
     logger.info("Trading system stopped")
 
 @router.get("/health")
@@ -218,10 +217,21 @@ async def websocket_trade_stream(websocket: WebSocket):
         connected_clients.remove(websocket)
 
 @router.get("/api/market/quote")
-async def get_market_quote(symbol: str) -> Dict:
-    """Get stock quote from market"""
+async def get_market_quote(
+    symbol: str,
+    exchange: str = "NSE",
+    segment: str = "CASH"
+) -> Dict:
+    """
+    Get full market quote for a stock.
+
+    Args:
+        symbol:   Trading symbol, e.g. RELIANCE
+        exchange: NSE (default) or BSE
+        segment:  CASH (default) or FNO
+    """
     try:
-        quote = await groww_client.get_stock_quote(symbol)
+        quote = await groww_service.get_quote(symbol, exchange, segment)
         if not quote:
             raise HTTPException(status_code=404, detail=f"Symbol {symbol} not found")
         return quote
@@ -229,13 +239,56 @@ async def get_market_quote(symbol: str) -> Dict:
         logger.error(f"Error fetching quote: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+@router.get("/api/market/ltp")
+async def get_ltp(
+    symbol: str,
+    exchange: str = "NSE",
+    segment: str = "CASH"
+) -> Dict:
+    """
+    Get Last Traded Price for a stock.
+
+    Args:
+        symbol:   Trading symbol, e.g. RELIANCE
+        exchange: NSE (default) or BSE
+        segment:  CASH (default) or FNO
+    """
+    try:
+        ltp = await groww_service.get_ltp(symbol, exchange, segment)
+        if ltp is None:
+            raise HTTPException(status_code=404, detail=f"LTP for {symbol} not found")
+        return {"symbol": symbol, "exchange": exchange, "ltp": ltp}
+    except Exception as e:
+        logger.error(f"Error fetching LTP: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 @router.get("/api/market/historical")
 async def get_historical_data(
-    symbol: str, period: str = "1y", interval: str = "1d"
+    symbol: str,
+    interval: str = "1day",
+    days: int = 365,
+    exchange: str = "NSE",
+    segment: str = "CASH"
 ) -> List[Dict]:
-    """Get historical market data"""
+    """
+    Get historical OHLCV candle data for a stock.
+
+    Args:
+        symbol:   Trading symbol, e.g. RELIANCE
+        interval: Candle interval – 1minute, 5minute, 15minute, 30minute,
+                  1hour, 4hour, 1day (default), 1week, 1month
+        days:     Number of calendar days to look back (max 365)
+        exchange: NSE (default) or BSE
+        segment:  CASH (default) or FNO
+    """
     try:
-        data = await groww_client.get_historical_data(symbol, period, interval)
+        data = await groww_service.get_historical_candles(
+            trading_symbol=symbol,
+            interval=interval,
+            days=days,
+            exchange=exchange,
+            segment=segment
+        )
         if not data:
             raise HTTPException(
                 status_code=404,
@@ -277,10 +330,10 @@ async def comprehensive_stock_analysis(symbol: str, risk_profile: str = "BALANCE
     try:
         from app.services.ai_analysis_advanced import ai_engine as advanced_ai
         
-        # Get market data
-        quote = await groww_client.get_stock_quote(symbol)
-        historical = await groww_client.get_historical_data(symbol, period="1y", interval="1d")
-        
+        # Get market data using real SDK methods
+        quote = await groww_service.get_quote(symbol)
+        historical = await groww_service.get_historical_candles(symbol, days=365)
+
         if not quote or not historical:
             raise HTTPException(status_code=404, detail=f"Data for {symbol} not available")
         
@@ -329,10 +382,10 @@ async def execute_advanced_trade(
         from app.services.ai_analysis_advanced import ai_engine as advanced_ai
         from app.services.explainable_ai import explainable_logger
         
-        # Get current price
-        quote = await groww_client.get_stock_quote(symbol)
-        price = quote.get("price", 0)
-        
+        # Get current price via real SDK
+        quote = await groww_service.get_quote(symbol)
+        price = (quote or {}).get("ltp") or (quote or {}).get("last_price") or 0
+
         if not price:
             raise HTTPException(status_code=404, detail=f"Price for {symbol} not available")
         
@@ -346,8 +399,8 @@ async def execute_advanced_trade(
         }
         
         # Get executor
-        executor = await get_executor(pt, groww_client, advanced_ai, explainable_logger)
-        
+        executor = await get_executor(pt, groww_service, advanced_ai, explainable_logger)
+
         # Execute trade
         result = await executor.execute_signal(signal, mode=mode)
         
@@ -366,7 +419,7 @@ async def set_stop_loss(symbol: str, stop_loss_price: float, mode: str = "PAPER"
         from app.services.ai_analysis_advanced import ai_engine as advanced_ai
         from app.services.explainable_ai import explainable_logger
         
-        executor = await get_executor(pt, groww_client, advanced_ai, explainable_logger)
+        executor = await get_executor(pt, groww_service, advanced_ai, explainable_logger)
         success = await executor.set_stop_loss(symbol, stop_loss_price, mode)
         
         logger.info(f"Stop loss set: {symbol} @ {stop_loss_price} ({mode})")
@@ -389,7 +442,7 @@ async def set_profit_target(symbol: str, target_price: float, mode: str = "PAPER
         from app.services.ai_analysis_advanced import ai_engine as advanced_ai
         from app.services.explainable_ai import explainable_logger
         
-        executor = await get_executor(pt, groww_client, advanced_ai, explainable_logger)
+        executor = await get_executor(pt, groww_service, advanced_ai, explainable_logger)
         success = await executor.set_profit_target(symbol, target_price, mode)
         
         logger.info(f"Profit target set: {symbol} @ {target_price} ({mode})")
@@ -440,10 +493,16 @@ async def select_options_strategy(
     """
     try:
         from app.services.options_trading_engine import options_engine
-        
-        # Get options chain
-        chain = await groww_client.get_options_chain(symbol)
-        
+
+        # Get nearest expiry then fetch options chain
+        expiries = await groww_service.get_expiries(symbol)
+        expiry_list = (expiries or {}).get("data") or (expiries or {}).get("expiries") or []
+        expiry_date = expiry_list[0] if expiry_list else None
+        if not expiry_date:
+            raise HTTPException(status_code=404, detail=f"No expiries found for {symbol}")
+
+        chain = await groww_service.get_option_chain(symbol, expiry_date)
+
         if not chain:
             raise HTTPException(status_code=404, detail=f"Options data for {symbol} not available")
         
@@ -487,16 +546,12 @@ async def recommend_mutual_funds(
     """
     try:
         from app.services.mutual_fund_analyzer import fund_analyzer
-        
-        # Get all available funds
-        all_funds = await groww_client.get_mutual_funds()
-        
-        if not all_funds:
-            raise HTTPException(status_code=404, detail="Mutual funds data not available")
-        
-        # Get AI recommendations
+
+        # NOTE: The Groww Trade API does not expose a mutual funds endpoint.
+        # Mutual fund recommendations are generated by the AI analyzer using
+        # publicly available fund data; no Groww API call is made here.
         recommendations = await fund_analyzer.recommend_funds(
-            all_funds=all_funds,
+            all_funds=[],  # fund_analyzer uses its own internal data source
             amount=amount,
             investment_horizon=investment_horizon,
             risk_profile=risk_profile,
@@ -680,7 +735,7 @@ async def get_execution_stats() -> Dict:
         from app.services.ai_analysis_advanced import ai_engine as advanced_ai
         from app.services.explainable_ai import explainable_logger
         
-        executor = await get_executor(pt, groww_client, advanced_ai, explainable_logger)
+        executor = await get_executor(pt, groww_service, advanced_ai, explainable_logger)
         stats = executor.get_execution_stats()
         
         logger.info("Execution stats retrieved")

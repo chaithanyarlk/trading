@@ -3,6 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import logging
 from app.api import routes
+from app.api.agent_routes import agent_router
 from app.core.config import settings
 
 # Configure logging
@@ -37,6 +38,7 @@ app.add_middleware(
 
 # Include routes
 app.include_router(routes.router)
+app.include_router(agent_router)
 
 @app.on_event("startup")
 async def startup_event():
@@ -51,7 +53,7 @@ async def startup_event():
         # Import services
         from app.services.orchestrator import get_orchestrator, get_executor
         from app.services.paper_trading_advanced import paper_trader
-        from app.services.groww_api_enhanced import groww_client
+        from app.services.groww_api_enhanced import get_groww_service
         from app.services.ai_analysis_advanced import ai_engine
         from app.services.explainable_ai import explainable_logger
         from app.models.database import Base
@@ -62,6 +64,9 @@ async def startup_event():
         Base.metadata.create_all(bind=engine)
         logger.info("✓ Database initialized")
         
+        # Initialize Groww service
+        groww_svc = await get_groww_service()
+
         # Initialize orchestrator
         logger.info("Starting Trade Execution Orchestrator...")
         orchestrator = await get_orchestrator()
@@ -70,7 +75,7 @@ async def startup_event():
         logger.info("Initializing Trade Executor...")
         executor = await get_executor(
             paper_trader,
-            groww_client,
+            groww_svc,
             ai_engine,
             explainable_logger
         )

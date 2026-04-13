@@ -9,6 +9,15 @@ import {
 import {
   OptionsSuggestionsModal, MutualFundsModal, StocksToWatchModal
 } from './components/Modals';
+import {
+  PaperTradingConfigPanel, AgentAnalysisPanel, AgentDecisionsList
+} from './components/AgentPanel';
+import {
+  GrowwPortfolioPanel, PotentialBuysPanel, InstrumentsPanel
+} from './components/PortfolioAndBuys';
+import {
+  SchedulerStatusBar, LiveActivityFeed, EodReportPanel
+} from './components/SchedulerAndReport';
 import { tradingAPI, createTradeStreamConnection } from './services/api';
 import { FaCog, FaScroll, FaChartPie } from 'react-icons/fa';
 import './App.css';
@@ -22,6 +31,13 @@ function App() {
   const [loading, setLoading] = useState(true);
   const [suggestions, setSuggestions] = useState([]);
   
+  // Agent system state
+  const [paperConfig, setPaperConfig] = useState(null);
+  const [agentDecisions, setAgentDecisions] = useState([]);
+  const [agentLoading, setAgentLoading] = useState(false);
+  const [agentPortfolio, setAgentPortfolio] = useState(null);
+  const [agentMetrics, setAgentMetrics] = useState(null);
+
   // Modals
   const [showOptionsModal, setShowOptionsModal] = useState(false);
   const [showFundsModal, setShowFundsModal] = useState(false);
@@ -38,7 +54,25 @@ function App() {
       if (ws) ws.close();
     };
   }, []);
-  
+
+  // Auto-refresh agent data every 30s when configured
+  useEffect(() => {
+    if (!paperConfig) return;
+    const interval = setInterval(async () => {
+      try {
+        const [portRes, perfRes] = await Promise.all([
+          tradingAPI.getAgentPortfolio(),
+          tradingAPI.getAgentPerformance(),
+        ]);
+        setAgentPortfolio(portRes.data);
+        setAgentMetrics(perfRes.data);
+      } catch (err) {
+        // silent
+      }
+    }, 30000);
+    return () => clearInterval(interval);
+  }, [paperConfig]);
+
   const initializeApp = async () => {
     try {
       setLoading(true);
@@ -122,11 +156,68 @@ function App() {
       
       setPortfolio(portfolioRes.data);
       setMetrics(metricsRes.data);
+
+      // Also refresh agent data if configured
+      if (paperConfig) {
+        try {
+          const [agentPortRes, agentPerfRes] = await Promise.all([
+            tradingAPI.getAgentPortfolio(),
+            tradingAPI.getAgentPerformance(),
+          ]);
+          setAgentPortfolio(agentPortRes.data);
+          setAgentMetrics(agentPerfRes.data);
+        } catch (err) {
+          console.error('Error refreshing agent data:', err);
+        }
+      }
     } catch (error) {
       console.error('Error refreshing data:', error);
     }
   };
-  
+
+  const handleConfigurePaperTrading = async (config) => {
+    const res = await tradingAPI.configurePaperTrading(config);
+    setPaperConfig(config);
+    return res;
+  };
+
+  const handleRunAgentAnalysis = async (symbols, config, autoExecute) => {
+    setAgentLoading(true);
+    try {
+      const res = await tradingAPI.runAgentPipeline(symbols, config, autoExecute);
+      setAgentDecisions(res.data.decisions || []);
+
+      // Refresh agent portfolio after execution
+      if (autoExecute) {
+        const [portRes, perfRes] = await Promise.all([
+          tradingAPI.getAgentPortfolio(),
+          tradingAPI.getAgentPerformance()
+        ]);
+        setAgentPortfolio(portRes.data);
+        setAgentMetrics(perfRes.data);
+      }
+    } catch (error) {
+      console.error('Error running agent analysis:', error);
+      alert('Error running analysis: ' + (error.response?.data?.detail || error.message));
+    }
+    setAgentLoading(false);
+  };
+
+  const handleExecuteDecision = async (decision) => {
+    try {
+      await tradingAPI.executeDecision(decision);
+      // Refresh
+      const [portRes, perfRes] = await Promise.all([
+        tradingAPI.getAgentPortfolio(),
+        tradingAPI.getAgentPerformance()
+      ]);
+      setAgentPortfolio(portRes.data);
+      setAgentMetrics(perfRes.data);
+    } catch (error) {
+      alert('Error executing trade: ' + (error.response?.data?.detail || error.message));
+    }
+  };
+
   if (loading) {
     return (
       <div className="min-h-screen bg-gradient-to-br from-blue-900 to-blue-700 flex items-center justify-center">
@@ -172,6 +263,72 @@ function App() {
       
       {/* Main Content */}
       <main className="max-w-7xl mx-auto px-4 py-8">
+        {/* ═══ MULTI-AGENT TRADING SYSTEM ═══ */}
+        <div className="mb-8">
+          <h2 className="text-2xl font-bold text-white mb-4">🤖 Multi-Agent Trading System</h2>
+
+          {/* Paper Trading Config from UI */}
+          <div className="mb-6">
+            <PaperTradingConfigPanel
+              onConfigure={handleConfigurePaperTrading}
+              currentConfig={paperConfig}
+            />
+          </div>
+
+          {/* Scheduler Status — shows if auto-scanning is running */}
+          <div className="mb-6">
+            <SchedulerStatusBar config={paperConfig} />
+          </div>
+
+          {/* Agent Analysis Runner */}
+          <div className="mb-6">
+            <AgentAnalysisPanel
+              onRunAnalysis={handleRunAgentAnalysis}
+              config={paperConfig}
+              loading={agentLoading}
+            />
+          </div>
+
+          {/* Agent Decisions + Live Feed */}
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-6">
+            <AgentDecisionsList
+              decisions={agentDecisions}
+              onExecute={handleExecuteDecision}
+            />
+            <LiveActivityFeed />
+          </div>
+
+          {/* Agent Portfolio */}
+          {agentPortfolio && agentPortfolio.configured !== false && (
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-6">
+              <PortfolioOverview portfolio={agentPortfolio} />
+              {agentMetrics && <PerformanceDashboard metrics={agentMetrics} />}
+            </div>
+          )}
+
+          {/* Potential Buy Stocks — support, SL, exit prices */}
+          <div className="mb-6">
+            <PotentialBuysPanel config={paperConfig} onExecute={null} />
+          </div>
+
+          {/* EOD Report — auto-generated at 3:35 PM IST */}
+          <div className="mb-6">
+            <EodReportPanel />
+          </div>
+
+          {/* Real Groww Portfolio */}
+          <div className="mb-6">
+            <GrowwPortfolioPanel />
+          </div>
+
+          {/* Instruments Summary */}
+          <div className="mb-6">
+            <InstrumentsPanel />
+          </div>
+        </div>
+
+        <hr className="border-gray-700 mb-8" />
+
         {/* Trading Mode */}
         <div className="mb-8">
           <TradingModeToggle
