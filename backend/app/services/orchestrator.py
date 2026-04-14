@@ -10,6 +10,8 @@ import pytz
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
+from app.core.config import settings
+
 logger = logging.getLogger(__name__)
 
 class TradeExecutionOrchestrator:
@@ -322,8 +324,8 @@ class AutomatedTradeExecutor:
             order_type = "LIMIT" if use_limit_order else "MARKET"
             
             result = await self.groww_client.place_order(
-                symbol=symbol,
-                action=action,
+                trading_symbol=symbol,
+                transaction_type=action,
                 quantity=quantity,
                 order_type=order_type,
                 price=price if use_limit_order else None
@@ -334,12 +336,12 @@ class AutomatedTradeExecutor:
                 await self.explainable_logger.log_trade_with_reasoning(
                     symbol=symbol,
                     action=action,
-                    entry_price=result.get("execution_price", price),
+                    entry_price=price,
                     quantity=quantity,
                     ai_analysis=signal,
                     technical_context=signal.get("technical_context", {}),
                     market_context=signal.get("market_context", {}),
-                    trade_id=result.get("order_id"),
+                    trade_id=result.get("groww_order_id"),
                     mode="LIVE"
                 )
                 

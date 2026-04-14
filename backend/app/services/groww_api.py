@@ -9,7 +9,7 @@ import logging
 from typing import Optional, List, Dict, Any, Tuple
 from functools import partial
 
-from growwapi import GrowwAPI
+from growwapi import GrowwAPI, GrowwFeed
 
 logger = logging.getLogger(__name__)
 
@@ -19,8 +19,8 @@ class GrowwAPIClient:
     Async-friendly wrapper around the official growwapi SDK (GrowwAPI).
 
     Authentication:
-        token = GrowwAPI.get_access_token(api_key, totp=totp, secret=secret)["data"]["access_token"]
-        client = GrowwAPIClient(token)
+        access_token = GrowwAPI.get_access_token(api_key=api_key, secret=secret)
+        client = GrowwAPIClient(access_token)
     """
 
     def __init__(self, token: str):
@@ -41,22 +41,20 @@ class GrowwAPIClient:
     # AUTH (static – call before creating the client)
     # ------------------------------------------------------------------
     @staticmethod
-    def get_access_token(api_key: str, totp: Optional[str] = None,
-                         secret: Optional[str] = None) -> Optional[str]:
+    def get_access_token(api_key: str, secret: str) -> Optional[str]:
         """
         Obtain an access token from Groww.
 
         Args:
             api_key: Your Groww API key
-            totp:    TOTP code (if TOTP-based auth)
-            secret:  Secret key (if secret-based auth)
+            secret:  Your Groww API secret
 
         Returns:
             access_token string, or None on failure
         """
         try:
-            result = GrowwAPI.get_access_token(api_key, totp=totp, secret=secret)
-            return result.get("data", {}).get("access_token")
+            access_token = GrowwAPI.get_access_token(api_key=api_key, secret=secret)
+            return access_token
         except Exception as e:
             logger.error(f"Failed to get access token: {e}")
             return None
@@ -100,10 +98,10 @@ class GrowwAPIClient:
 
     async def get_instrument_by_groww_symbol(self, groww_symbol: str) -> Optional[Dict]:
         """
-        Look up an instrument by its Groww symbol (e.g. "NSE_EQ|INE009A01021").
+        Look up an instrument by its Groww symbol (e.g. "NSE-RELIANCE").
 
         Args:
-            groww_symbol: Groww contract identifier
+            groww_symbol: Groww contract identifier e.g. "NSE-RELIANCE"
         """
         try:
             return await self._run(self._sdk.get_instrument_by_groww_symbol, groww_symbol)
@@ -150,40 +148,53 @@ class GrowwAPIClient:
     # ------------------------------------------------------------------
     async def get_ltp(
         self,
-        exchange_trading_symbols: Tuple[str, ...],
+        exchange_trading_symbols: str,
         segment: str
     ) -> Optional[Dict]:
         """
-        Get Last Traded Price for one or more symbols.
+        Get Last Traded Price for a symbol.
 
         Args:
-            exchange_trading_symbols: Tuple of "EXCHANGE:SYMBOL" strings,
-                                      e.g. ("NSE:RELIANCE", "NSE:TCS")
-            segment: GrowwAPI.SEGMENT_CASH | SEGMENT_FNO | etc.
+            exchange_trading_symbols: e.g. "NSE_RELIANCE"
+                                      Format: "{EXCHANGE}_{trading_symbol}"
+            segment: Segment from instrument e.g. "CASH", "FNO"
 
         Returns:
-            dict with LTP data keyed by symbol
+            dict e.g. {"ltp": 149.5}
         """
         try:
-            return await self._run(self._sdk.get_ltp, exchange_trading_symbols, segment)
+            return await self._run(
+                self._sdk.get_ltp,
+                exchange_trading_symbols=exchange_trading_symbols,
+                segment=segment
+            )
         except Exception as e:
             logger.error(f"get_ltp error: {e}")
             return None
 
     async def get_ohlc(
         self,
-        exchange_trading_symbols: Tuple[str, ...],
-        segment: str
+        segment: str,
+        exchange_trading_symbols: Any
     ) -> Optional[Dict]:
         """
         Get OHLC data for one or more symbols.
 
         Args:
-            exchange_trading_symbols: Tuple of "EXCHANGE:SYMBOL" strings
             segment: GrowwAPI.SEGMENT_CASH | SEGMENT_FNO | etc.
+            exchange_trading_symbols: Single string e.g. "NSE_NIFTY"
+                                      or tuple e.g. ("NSE_NIFTY", "NSE_RELIANCE")
+
+        Returns:
+            dict keyed by symbol e.g.
+            {"NSE_RELIANCE": {"open": ..., "high": ..., "low": ..., "close": ...}}
         """
         try:
-            return await self._run(self._sdk.get_ohlc, exchange_trading_symbols, segment)
+            return await self._run(
+                self._sdk.get_ohlc,
+                segment=segment,
+                exchange_trading_symbols=exchange_trading_symbols
+            )
         except Exception as e:
             logger.error(f"get_ohlc error: {e}")
             return None
@@ -211,69 +222,30 @@ class GrowwAPIClient:
     # ------------------------------------------------------------------
     # HISTORICAL DATA
     # ------------------------------------------------------------------
-    async def get_historical_candles(
-        self,
-        exchange: str,
-        segment: str,
-        trading_symbol: str,
-        interval: str,
-        from_date: str,
-        to_date: str
-    ) -> Optional[Any]:
-        """
-        Fetch historical OHLCV candles.
-
-        Args:
-            exchange:       GrowwAPI.EXCHANGE_NSE
-            segment:        GrowwAPI.SEGMENT_CASH | SEGMENT_FNO
-            trading_symbol: e.g. "RELIANCE"
-            interval:       GrowwAPI.CANDLE_INTERVAL_DAY | CANDLE_INTERVAL_MIN_1 | etc.
-                            Valid values: "1minute","2minute","3minute","5minute",
-                                         "10minute","15minute","30minute",
-                                         "1hour","4hour","1day","1week","1month"
-            from_date:      "YYYY-MM-DD"
-            to_date:        "YYYY-MM-DD"
-
-        Returns:
-            DataFrame or list of candle dicts returned by SDK
-        """
-        try:
-            return await self._run(
-                self._sdk.get_historical_candles,
-                exchange, segment, trading_symbol, interval, from_date, to_date
-            )
-        except Exception as e:
-            logger.error(f"get_historical_candles({trading_symbol}) error: {e}")
-            return None
-
-    async def get_historical_candle_data_v2(
+    async def get_historical_candle_data(
         self,
         trading_symbol: str,
         exchange: str,
         segment: str,
         start_time: str,
         end_time: str,
-        interval_in_minutes: int = 1440,
-    ) -> Optional[Any]:
+        interval_in_minutes: int = 5,
+    ) -> Optional[Dict]:
         """
-        Fetch historical candle data using the correct SDK signature.
-
-        Per Groww SDK docs the method accepts:
-            trading_symbol, exchange, segment, start_time, end_time,
-            interval_in_minutes
+        Fetch historical OHLCV candle data.
 
         Args:
-            trading_symbol: e.g. "RELIANCE"
-            exchange:       GrowwAPI.EXCHANGE_NSE
-            segment:        GrowwAPI.SEGMENT_CASH
-            start_time:     "yyyy-MM-dd HH:mm:ss"  e.g. "2025-04-01 09:15:00"
-            end_time:       "yyyy-MM-dd HH:mm:ss"  e.g. "2026-04-13 15:30:00"
-            interval_in_minutes: Candle width in minutes.
-                                 1=1min, 5=5min, 15=15min, 30=30min,
-                                 60=1hr, 240=4hr, 1440=1day, 10080=1week
+            trading_symbol:      e.g. "RELIANCE"
+            exchange:            GrowwAPI.EXCHANGE_NSE
+            segment:             GrowwAPI.SEGMENT_CASH
+            start_time:          "yyyy-MM-dd HH:mm:ss" e.g. "2025-02-27 10:00:00"
+            end_time:            "yyyy-MM-dd HH:mm:ss" e.g. "2025-02-27 14:00:00"
+            interval_in_minutes: Candle width in minutes (default 5).
+                                 1, 5, 15, 30, 60, 240, 1440, 10080
 
         Returns:
-            DataFrame or list of candle dicts from SDK
+            dict e.g. {"candles": [[epoch_sec, open, high, low, close, volume], ...],
+                       "start_time": "...", "end_time": "...", "interval_in_minutes": 5}
         """
         try:
             return await self._run(
@@ -286,7 +258,7 @@ class GrowwAPIClient:
                 interval_in_minutes=interval_in_minutes,
             )
         except Exception as e:
-            logger.error(f"get_historical_candle_data_v2({trading_symbol}) error: {e}")
+            logger.error(f"get_historical_candle_data({trading_symbol}) error: {e}")
             return None
 
     # ------------------------------------------------------------------
@@ -297,10 +269,14 @@ class GrowwAPIClient:
         Fetch long-term equity holdings (CNC/delivery positions).
 
         Returns:
-            SDK response dict with holdings list
+            SDK response dict with "holdings" list containing:
+              isin, trading_symbol, quantity, average_price,
+              pledge_quantity, demat_locked_quantity, groww_locked_quantity,
+              repledge_quantity, t1_quantity, demat_free_quantity,
+              corporate_action_additional_quantity, active_demat_transfer_quantity
         """
         try:
-            return await self._run(self._sdk.get_holdings_for_user)
+            return await self._run(self._sdk.get_holdings_for_user, timeout=5)
         except Exception as e:
             logger.error(f"get_holdings error: {e}")
             return None
@@ -342,14 +318,14 @@ class GrowwAPIClient:
     async def place_order(
         self,
         trading_symbol: str,
+        quantity: int,
+        validity: str,
         exchange: str,
         segment: str,
-        transaction_type: str,
-        quantity: int,
-        order_type: str,
         product: str,
-        validity: str,
-        price: float = 0.0,
+        order_type: str,
+        transaction_type: str,
+        price: Optional[float] = None,
         trigger_price: Optional[float] = None,
         order_reference_id: Optional[str] = None
     ) -> Optional[Dict]:
@@ -357,36 +333,41 @@ class GrowwAPIClient:
         Place a new order.
 
         Args:
-            trading_symbol:    e.g. "RELIANCE"
+            trading_symbol:    e.g. "WIPRO"
+            quantity:          Number of shares/lots
+            validity:          GrowwAPI.VALIDITY_DAY | IOC | GTC | GTD | EOS
             exchange:          GrowwAPI.EXCHANGE_NSE | EXCHANGE_BSE
             segment:           GrowwAPI.SEGMENT_CASH | SEGMENT_FNO
-            transaction_type:  GrowwAPI.TRANSACTION_TYPE_BUY | TRANSACTION_TYPE_SELL
-            quantity:          Number of shares/lots
-            order_type:        GrowwAPI.ORDER_TYPE_MARKET | LIMIT | SL | SL_M
             product:           GrowwAPI.PRODUCT_CNC (delivery) | MIS (intraday) | NRML (F&O)
-            validity:          GrowwAPI.VALIDITY_DAY | IOC | GTC | GTD | EOS
-            price:             Required for LIMIT / SL; 0.0 for MARKET
-            trigger_price:     Required for SL / SL_M orders
-            order_reference_id: Optional client-side reference ID
+            order_type:        GrowwAPI.ORDER_TYPE_LIMIT | MARKET | STOP_LOSS | STOP_LOSS_MARKET
+            transaction_type:  GrowwAPI.TRANSACTION_TYPE_BUY | TRANSACTION_TYPE_SELL
+            price:             Optional: Price for LIMIT / SL orders
+            trigger_price:     Optional: Trigger price for SL / SL_M orders
+            order_reference_id: Optional: 8-20 char alphanumeric reference ID
 
         Returns:
-            SDK response dict containing groww_order_id on success
+            dict e.g. {"groww_order_id": "...", "order_status": "OPEN",
+                       "order_reference_id": "...", "remark": "Order placed successfully"}
         """
         try:
-            return await self._run(
-                self._sdk.place_order,
+            kwargs = dict(
+                trading_symbol=trading_symbol,
+                quantity=quantity,
                 validity=validity,
                 exchange=exchange,
-                order_type=order_type,
-                product=product,
-                quantity=quantity,
                 segment=segment,
-                trading_symbol=trading_symbol,
+                product=product,
+                order_type=order_type,
                 transaction_type=transaction_type,
-                order_reference_id=order_reference_id,
-                price=price,
-                trigger_price=trigger_price
             )
+            if price is not None:
+                kwargs["price"] = price
+            if trigger_price is not None:
+                kwargs["trigger_price"] = trigger_price
+            if order_reference_id is not None:
+                kwargs["order_reference_id"] = order_reference_id
+
+            return await self._run(self._sdk.place_order, **kwargs)
         except Exception as e:
             logger.error(f"place_order({trading_symbol} {transaction_type}) error: {e}")
             return None
@@ -409,10 +390,10 @@ class GrowwAPIClient:
 
     async def modify_order(
         self,
+        quantity: int,
+        order_type: str,
         segment: str,
         groww_order_id: str,
-        order_type: str,
-        quantity: int,
         price: Optional[float] = None,
         trigger_price: Optional[float] = None
     ) -> Optional[Dict]:
@@ -420,23 +401,29 @@ class GrowwAPIClient:
         Modify an existing open order.
 
         Args:
+            quantity:       New quantity
+            order_type:     GrowwAPI.ORDER_TYPE_MARKET | LIMIT | STOP_LOSS | STOP_LOSS_MARKET
             segment:        GrowwAPI.SEGMENT_CASH | SEGMENT_FNO
             groww_order_id: Order ID to modify
-            order_type:     GrowwAPI.ORDER_TYPE_LIMIT | SL | SL_M
-            quantity:       New quantity
-            price:          New limit price (for LIMIT / SL)
-            trigger_price:  New trigger price (for SL / SL_M)
+            price:          Optional: New limit price (for LIMIT / SL)
+            trigger_price:  Optional: New trigger price (for SL / SL_M)
+
+        Returns:
+            dict e.g. {"groww_order_id": "...", "order_status": "OPEN"}
         """
         try:
-            return await self._run(
-                self._sdk.modify_order,
+            kwargs = dict(
+                quantity=quantity,
                 order_type=order_type,
                 segment=segment,
                 groww_order_id=groww_order_id,
-                quantity=quantity,
-                price=price,
-                trigger_price=trigger_price
             )
+            if price is not None:
+                kwargs["price"] = price
+            if trigger_price is not None:
+                kwargs["trigger_price"] = trigger_price
+
+            return await self._run(self._sdk.modify_order, **kwargs)
         except Exception as e:
             logger.error(f"modify_order({groww_order_id}) error: {e}")
             return None
@@ -540,11 +527,18 @@ class GrowwAPIClient:
         Args:
             exchange:     GrowwAPI.EXCHANGE_NSE
             underlying:   Underlying symbol e.g. "NIFTY" or "RELIANCE"
-            expiry_date:  "YYYY-MM-DD"
+            expiry_date:  "YYYY-MM-DD" e.g. "2025-11-28"
+
+        Returns:
+            dict with "underlying_ltp" and "strikes" keyed by strike price,
+            each containing CE/PE with greeks, trading_symbol, ltp, open_interest, volume
         """
         try:
             return await self._run(
-                self._sdk.get_option_chain, exchange, underlying, expiry_date
+                self._sdk.get_option_chain,
+                exchange=exchange,
+                underlying=underlying,
+                expiry_date=expiry_date
             )
         except Exception as e:
             logger.error(f"get_option_chain({underlying}) error: {e}")
@@ -601,17 +595,25 @@ class GrowwAPIClient:
         expiry: str
     ) -> Optional[Dict]:
         """
-        Get option Greeks (delta, gamma, theta, vega, IV) for a contract.
+        Get option Greeks (delta, gamma, theta, vega, rho, IV) for an FNO contract.
 
         Args:
             exchange:       GrowwAPI.EXCHANGE_NSE
             underlying:     Underlying symbol e.g. "NIFTY"
-            trading_symbol: Option contract symbol e.g. "NIFTY24APR22000CE"
-            expiry:         "YYYY-MM-DD"
+            trading_symbol: Option contract symbol e.g. "NIFTY25O1425100CE"
+            expiry:         "YYYY-MM-DD" e.g. "2025-10-14"
+
+        Returns:
+            dict e.g. {"greeks": {"delta": 0.6, "gamma": 0.0014,
+                       "theta": -8.1, "vega": 13.1, "rho": 2.7, "iv": 8.2}}
         """
         try:
             return await self._run(
-                self._sdk.get_greeks, exchange, underlying, trading_symbol, expiry
+                self._sdk.get_greeks,
+                exchange=exchange,
+                underlying=underlying,
+                trading_symbol=trading_symbol,
+                expiry=expiry
             )
         except Exception as e:
             logger.error(f"get_greeks({trading_symbol}) error: {e}")
@@ -721,4 +723,283 @@ class GrowwAPIClient:
 
     SMART_ORDER_TYPE_GTT = GrowwAPI.SMART_ORDER_TYPE_GTT
     SMART_ORDER_TYPE_OCO = GrowwAPI.SMART_ORDER_TYPE_OCO
+
+
+class GrowwFeedClient:
+    """
+    Wrapper around GrowwFeed for live market data streaming.
+
+    GrowwFeed provides real-time LTP data via WebSocket.
+    feed.consume() is blocking, so it runs in a background thread.
+    Polling via feed.get_ltp() is used for synchronous access.
+
+    Usage:
+        groww = GrowwAPI(access_token)
+        feed_client = GrowwFeedClient(groww)
+        feed_client.subscribe_ltp([
+            {"exchange": "NSE", "segment": "CASH", "exchange_token": "2885"},
+        ])
+        feed_client.start()          # starts consume() in background thread
+        ltp_data = feed_client.get_ltp()
+        feed_client.unsubscribe_ltp([...])
+        feed_client.stop()
+    """
+
+    def __init__(self, groww_api: GrowwAPI):
+        """
+        Args:
+            groww_api: An initialised GrowwAPI instance
+        """
+        self._feed = GrowwFeed(groww_api)
+        self._consume_thread: Optional[asyncio.Task] = None
+        self._running = False
+        self._subscribed_instruments: List[Dict] = []
+        self._subscribed_indices: List[Dict] = []
+        self._fno_order_updates_subscribed = False
+        self._equity_order_updates_subscribed = False
+
+    # ------------------------------------------------------------------
+    # LTP subscriptions
+    # ------------------------------------------------------------------
+    def subscribe_ltp(
+        self,
+        instruments: List[Dict],
+        on_data_received=None
+    ):
+        """
+        Subscribe to live LTP for a list of instruments.
+
+        Args:
+            instruments: List of dicts e.g.
+                [{"exchange": "NSE", "segment": "CASH", "exchange_token": "2885"}]
+            on_data_received: Optional callback triggered when data arrives
+        """
+        if on_data_received:
+            self._feed.subscribe_ltp(instruments, on_data_received=on_data_received)
+        else:
+            self._feed.subscribe_ltp(instruments)
+        self._subscribed_instruments.extend(instruments)
+        logger.info(f"Subscribed to LTP for {len(instruments)} instruments")
+
+    def unsubscribe_ltp(self, instruments: List[Dict]):
+        """
+        Unsubscribe from live LTP for a list of instruments.
+
+        Args:
+            instruments: Same format as subscribe_ltp
+        """
+        self._feed.unsubscribe_ltp(instruments)
+        for inst in instruments:
+            if inst in self._subscribed_instruments:
+                self._subscribed_instruments.remove(inst)
+        logger.info(f"Unsubscribed from LTP for {len(instruments)} instruments")
+
+    def get_ltp(self) -> Optional[Dict]:
+        """
+        Get the latest LTP data (synchronous poll).
+
+        Returns:
+            dict e.g.
+            {"ltp": {"NSE": {"CASH": {"2885": {"tsInMillis": ..., "ltp": 1419.1}}}}}
+        """
+        try:
+            return self._feed.get_ltp()
+        except Exception as e:
+            logger.error(f"get_ltp error: {e}")
+            return None
+
+    # ------------------------------------------------------------------
+    # Index value subscriptions
+    # ------------------------------------------------------------------
+    def subscribe_index_value(
+        self,
+        instruments: List[Dict],
+        on_data_received=None
+    ):
+        """
+        Subscribe to live index values.
+
+        Args:
+            instruments: List of dicts e.g.
+                [{"exchange": "NSE", "segment": "CASH", "exchange_token": "NIFTY"},
+                 {"exchange": "BSE", "segment": "CASH", "exchange_token": "1"}]
+            on_data_received: Optional callback triggered when data arrives
+        """
+        if on_data_received:
+            self._feed.subscribe_index_value(instruments, on_data_received=on_data_received)
+        else:
+            self._feed.subscribe_index_value(instruments)
+        self._subscribed_indices.extend(instruments)
+        logger.info(f"Subscribed to index values for {len(instruments)} indices")
+
+    def unsubscribe_index_value(self, instruments: List[Dict]):
+        """
+        Unsubscribe from live index values.
+
+        Args:
+            instruments: Same format as subscribe_index_value
+        """
+        self._feed.unsubscribe_index_value(instruments)
+        for inst in instruments:
+            if inst in self._subscribed_indices:
+                self._subscribed_indices.remove(inst)
+        logger.info(f"Unsubscribed from index values for {len(instruments)} indices")
+
+    def get_index_value(self) -> Optional[Dict]:
+        """
+        Get the latest index values (synchronous poll).
+
+        Returns:
+            dict e.g.
+            {"NSE": {"CASH": {"NIFTY": {"tsInMillis": ..., "value": 24386.7}}},
+             "BSE": {"CASH": {"1": {"tsInMillis": ..., "value": 73386.7}}}}
+        """
+        try:
+            return self._feed.get_index_value()
+        except Exception as e:
+            logger.error(f"get_index_value error: {e}")
+            return None
+
+    # ------------------------------------------------------------------
+    # FNO order updates
+    # ------------------------------------------------------------------
+    def subscribe_fno_order_updates(self, on_data_received=None):
+        """
+        Subscribe to derivative (FNO) order updates.
+
+        Args:
+            on_data_received: Optional callback triggered when an order update arrives.
+                              Receives a meta dict with "feed_type" and "segment" keys.
+        """
+        if on_data_received:
+            self._feed.subscribe_fno_order_updates(on_data_received=on_data_received)
+        else:
+            self._feed.subscribe_fno_order_updates()
+        self._fno_order_updates_subscribed = True
+        logger.info("Subscribed to FNO order updates")
+
+    def unsubscribe_fno_order_updates(self):
+        """Unsubscribe from FNO order updates."""
+        self._feed.unsubscribe_fno_order_updates()
+        self._fno_order_updates_subscribed = False
+        logger.info("Unsubscribed from FNO order updates")
+
+    def get_fno_order_update(self) -> Optional[Dict]:
+        """
+        Get the latest FNO order update (synchronous poll).
+
+        Returns:
+            dict e.g.
+            {"qty": 75, "price": "130", "filledQty": 75, "avgFillPrice": "110",
+             "growwOrderId": "...", "exchangeOrderId": "...",
+             "orderStatus": "EXECUTED", "duration": "DAY",
+             "exchange": "NSE", "segment": "FNO", "product": "NRML",
+             "contractId": "NIFTY2522025400CE"}
+        """
+        try:
+            return self._feed.get_fno_order_update()
+        except Exception as e:
+            logger.error(f"get_fno_order_update error: {e}")
+            return None
+
+    # ------------------------------------------------------------------
+    # Equity order updates
+    # ------------------------------------------------------------------
+    def subscribe_equity_order_updates(self, on_data_received=None):
+        """
+        Subscribe to equity (CASH segment) order updates.
+
+        Args:
+            on_data_received: Optional callback triggered when an order update arrives.
+                              Receives a meta dict with "feed_type" and "segment" keys.
+        """
+        if on_data_received:
+            self._feed.subscribe_equity_order_updates(on_data_received=on_data_received)
+        else:
+            self._feed.subscribe_equity_order_updates()
+        self._equity_order_updates_subscribed = True
+        logger.info("Subscribed to equity order updates")
+
+    def unsubscribe_equity_order_updates(self):
+        """Unsubscribe from equity order updates."""
+        self._feed.unsubscribe_equity_order_updates()
+        self._equity_order_updates_subscribed = False
+        logger.info("Unsubscribed from equity order updates")
+
+    def get_equity_order_update(self) -> Optional[Dict]:
+        """
+        Get the latest equity order update (synchronous poll).
+
+        Returns:
+            dict e.g.
+            {"qty": 3, "filledQty": 3, "avgFillPrice": "145",
+             "growwOrderId": "...", "exchangeOrderId": "...",
+             "orderStatus": "EXECUTED", "duration": "DAY",
+             "exchange": "NSE", "contractId": "INE221H01019"}
+        """
+        try:
+            return self._feed.get_equity_order_update()
+        except Exception as e:
+            logger.error(f"get_equity_order_update error: {e}")
+            return None
+
+    async def start(self):
+        """
+        Start consuming the feed in a background thread.
+        feed.consume() is blocking, so it runs via run_in_executor.
+        """
+        if self._running:
+            logger.warning("Feed is already running")
+            return
+        self._running = True
+        loop = asyncio.get_event_loop()
+        loop.run_in_executor(None, self._consume_blocking)
+        logger.info("GrowwFeed consumer started in background thread")
+
+    def _consume_blocking(self):
+        """Blocking call — runs in a separate thread."""
+        try:
+            self._feed.consume()
+        except Exception as e:
+            logger.error(f"GrowwFeed consume error: {e}")
+        finally:
+            self._running = False
+
+    def stop(self):
+        """Unsubscribe all and stop the feed."""
+        if self._subscribed_instruments:
+            try:
+                self._feed.unsubscribe_ltp(self._subscribed_instruments)
+            except Exception as e:
+                logger.error(f"Error unsubscribing LTP: {e}")
+        if self._subscribed_indices:
+            try:
+                self._feed.unsubscribe_index_value(self._subscribed_indices)
+            except Exception as e:
+                logger.error(f"Error unsubscribing index values: {e}")
+        if self._fno_order_updates_subscribed:
+            try:
+                self._feed.unsubscribe_fno_order_updates()
+            except Exception as e:
+                logger.error(f"Error unsubscribing FNO order updates: {e}")
+        if self._equity_order_updates_subscribed:
+            try:
+                self._feed.unsubscribe_equity_order_updates()
+            except Exception as e:
+                logger.error(f"Error unsubscribing equity order updates: {e}")
+        self._subscribed_instruments = []
+        self._subscribed_indices = []
+        self._fno_order_updates_subscribed = False
+        self._equity_order_updates_subscribed = False
+        self._running = False
+        logger.info("GrowwFeed stopped")
+
+    @property
+    def is_running(self) -> bool:
+        return self._running
+
+    @property
+    def subscribed_instruments(self) -> List[Dict]:
+        return self._subscribed_instruments.copy()
+
 

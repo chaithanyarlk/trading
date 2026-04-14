@@ -57,7 +57,7 @@ export const GrowwPortfolioPanel = () => {
       {isOffline && (
         <div className="bg-yellow-50 border border-yellow-200 rounded p-3 mb-3">
           <p className="text-yellow-700 text-sm">
-            ⚠️ Groww API offline — set GROWW_API_KEY and GROWW_AUTH_TOKEN in .env to see real portfolio
+            ⚠️ Groww API offline — set GROWW_API_KEY and GROWW_API_SECRET in .env to see real portfolio
           </p>
         </div>
       )}
@@ -78,20 +78,18 @@ export const GrowwPortfolioPanel = () => {
         {holdings && holdings.online ? (
           <div className="overflow-auto max-h-64">
             {(() => {
-              const holdingList = holdings.holdings?.data || holdings.holdings?.holdings || holdings.holdings;
+              const holdingList = holdings.holdings?.holdings || holdings.holdings;
               if (Array.isArray(holdingList) && holdingList.length > 0) {
                 return holdingList.map((h, i) => (
                   <div key={i} className="flex justify-between items-center py-2 border-b text-sm">
                     <div>
-                      <p className="font-semibold">{h.trading_symbol || h.symbol || 'Unknown'}</p>
-                      <p className="text-xs text-gray-500">Qty: {h.quantity || h.qty || 0} | Avg: ₹{(h.average_price || h.avg_price || 0).toFixed(2)}</p>
+                      <p className="font-semibold">{h.trading_symbol || 'Unknown'}</p>
+                      <p className="text-xs text-gray-500">ISIN: {h.isin || '-'}</p>
+                      <p className="text-xs text-gray-500">Qty: {h.quantity || 0} | Avg: ₹{(h.average_price || 0).toFixed(2)}</p>
                     </div>
                     <div className="text-right">
-                      <p className="font-semibold">₹{(h.ltp || h.last_price || 0).toFixed(2)}</p>
-                      <p className={`text-xs ${(h.pnl || 0) >= 0 ? 'text-green-600' : 'text-red-600'}`}>
-                        {(h.pnl || 0) >= 0 ? <FaArrowUp className="inline" /> : <FaArrowDown className="inline" />}
-                        {' '}₹{(h.pnl || 0).toFixed(2)}
-                      </p>
+                      <p className="text-xs text-gray-500">Free: {h.demat_free_quantity || 0} | T1: {h.t1_quantity || 0}</p>
+                      <p className="text-xs text-gray-500">Pledged: {h.pledge_quantity || 0}</p>
                     </div>
                   </div>
                 ));

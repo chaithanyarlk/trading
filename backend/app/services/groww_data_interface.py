@@ -111,12 +111,9 @@ class GrowwDataInterface:
         Classify instruments into stocks, options, futures.
 
         Logic (from Groww instrument master):
-          - Options: trading_symbol contains CE or PE at the end,
-                     e.g. NIFTY25MAR29050PE, ABB25APR9600PE
-          - Futures: trading_symbol ends with FUT,
-                     e.g. ASIANPAINT25FEBFUT
-          - Stocks (equity): everything else in CASH segment
-                     (no FUT/CE/PE suffix), e.g. RELIANCE, TCS
+          - Stocks (equity): exchange == "NSE" and segment == "CASH"
+          - Options: trading_symbol ends with CE or PE
+          - Futures: trading_symbol ends with FUT
         """
         self._stocks_cache = []
         self._options_cache = []
@@ -127,14 +124,14 @@ class GrowwDataInterface:
 
         for inst in instruments:
             sym = inst.get("trading_symbol", "") or ""
+            exchange = inst.get("exchange", "") or ""
             segment = inst.get("segment", "") or ""
 
             if option_re.search(sym):
                 self._options_cache.append(inst)
             elif future_re.search(sym):
                 self._futures_cache.append(inst)
-            else:
-                # Equity / stock — no FUT/CE/PE suffix
+            elif exchange == "NSE" and segment == "CASH":
                 self._stocks_cache.append(inst)
 
         logger.info(
@@ -220,9 +217,9 @@ class GrowwDataInterface:
         symbol: str,
         transaction_type: str,
         quantity: int,
-        order_type: str = "MARKET",
+        order_type: str = "LIMIT",
         product: str = "CNC",
-        price: float = 0.0,
+        price: Optional[float] = None,
         trigger_price: Optional[float] = None,
         exchange: str = "NSE",
     ) -> Optional[Dict]:
@@ -269,14 +266,20 @@ class GrowwDataInterface:
         Get delivery holdings from Groww account.
         Returns raw SDK response — typically:
         {
-          "data": [
+          "holdings": [
             {
+              "isin": "INE545U01014",
               "trading_symbol": "RELIANCE",
               "quantity": 10,
-              "average_price": 2500.0,
-              "ltp": 2845.5,
-              "pnl": 3455.0,
-              ...
+              "average_price": 100,
+              "pledge_quantity": 2,
+              "demat_locked_quantity": 1,
+              "groww_locked_quantity": 1.5,
+              "repledge_quantity": 0.5,
+              "t1_quantity": 3,
+              "demat_free_quantity": 5,
+              "corporate_action_additional_quantity": 1,
+              "active_demat_transfer_quantity": 1
             }
           ]
         }
@@ -307,6 +310,144 @@ class GrowwDataInterface:
         """Get the order book (paginated)."""
         svc = await self._get_service()
         return await svc.get_order_list(page=page, page_size=page_size)
+
+    # ──────────────────────────────────────────────────────────────────
+    # 15. LIVE FEED (GrowwFeed WebSocket)
+    # ──────────────────────────────────────────────────────────────────
+    async def subscribe_live_ltp(
+        self,
+        instruments: List[Dict],
+        on_data_received=None,
+    ):
+        """
+        Subscribe to live LTP for instruments.
+
+        Args:
+            instruments: e.g. [{"exchange": "NSE", "segment": "CASH", "exchange_token": "2885"}]
+            on_data_received: Optional callback when data arrives
+        """
+        svc = await self._get_service()
+        svc.subscribe_live_ltp(instruments, on_data_received=on_data_received)
+
+    async def unsubscribe_live_ltp(self, instruments: List[Dict]):
+        """Unsubscribe from live LTP for instruments."""
+        svc = await self._get_service()
+        svc.unsubscribe_live_ltp(instruments)
+
+    async def get_live_ltp(self) -> Optional[Dict]:
+        """
+        Poll latest live LTP data.
+
+        Returns:
+            dict e.g.
+            {"ltp": {"NSE": {"CASH": {"2885": {"tsInMillis": ..., "ltp": 1419.1}}}}}
+        """
+        svc = await self._get_service()
+        return svc.get_live_ltp()
+
+    async def start_live_feed(self):
+        """Start the live feed consumer in a background thread."""
+        svc = await self._get_service()
+        await svc.start_live_feed()
+
+    async def stop_live_feed(self):
+        """Stop the live feed."""
+        svc = await self._get_service()
+        svc.stop_live_feed()
+
+    # ──────────────────────────────────────────────────────────────────
+    # 16. LIVE INDEX VALUES (GrowwFeed WebSocket)
+    # ──────────────────────────────────────────────────────────────────
+    async def subscribe_live_index_value(
+        self,
+        instruments: List[Dict],
+        on_data_received=None,
+    ):
+        """
+        Subscribe to live index values.
+
+        Args:
+            instruments: e.g. [{"exchange": "NSE", "segment": "CASH", "exchange_token": "NIFTY"}]
+            on_data_received: Optional callback when data arrives
+        """
+        svc = await self._get_service()
+        svc.subscribe_live_index_value(instruments, on_data_received=on_data_received)
+
+    async def unsubscribe_live_index_value(self, instruments: List[Dict]):
+        """Unsubscribe from live index values."""
+        svc = await self._get_service()
+        svc.unsubscribe_live_index_value(instruments)
+
+    async def get_live_index_value(self) -> Optional[Dict]:
+        """
+        Poll latest live index values.
+
+        Returns:
+            dict e.g.
+            {"NSE": {"CASH": {"NIFTY": {"tsInMillis": ..., "value": 24386.7}}}}
+        """
+        svc = await self._get_service()
+        return svc.get_live_index_value()
+
+    # ──────────────────────────────────────────────────────────────────
+    # 17. FNO ORDER UPDATES (GrowwFeed WebSocket)
+    # ──────────────────────────────────────────────────────────────────
+    async def subscribe_fno_order_updates(self, on_data_received=None):
+        """
+        Subscribe to derivative (FNO) order updates.
+
+        Args:
+            on_data_received: Optional callback when an order update arrives
+        """
+        svc = await self._get_service()
+        svc.subscribe_fno_order_updates(on_data_received=on_data_received)
+
+    async def unsubscribe_fno_order_updates(self):
+        """Unsubscribe from FNO order updates."""
+        svc = await self._get_service()
+        svc.unsubscribe_fno_order_updates()
+
+    async def get_fno_order_update(self) -> Optional[Dict]:
+        """
+        Poll latest FNO order update.
+
+        Returns:
+            dict e.g.
+            {"qty": 75, "price": "130", "filledQty": 75, "avgFillPrice": "110",
+             "growwOrderId": "...", "orderStatus": "EXECUTED", ...}
+        """
+        svc = await self._get_service()
+        return svc.get_fno_order_update()
+
+    # ──────────────────────────────────────────────────────────────────
+    # 18. EQUITY ORDER UPDATES (GrowwFeed WebSocket)
+    # ──────────────────────────────────────────────────────────────────
+    async def subscribe_equity_order_updates(self, on_data_received=None):
+        """
+        Subscribe to equity (CASH segment) order updates.
+
+        Args:
+            on_data_received: Optional callback when an order update arrives
+        """
+        svc = await self._get_service()
+        svc.subscribe_equity_order_updates(on_data_received=on_data_received)
+
+    async def unsubscribe_equity_order_updates(self):
+        """Unsubscribe from equity order updates."""
+        svc = await self._get_service()
+        svc.unsubscribe_equity_order_updates()
+
+    async def get_equity_order_update(self) -> Optional[Dict]:
+        """
+        Poll latest equity order update.
+
+        Returns:
+            dict e.g.
+            {"qty": 3, "filledQty": 3, "avgFillPrice": "145",
+             "growwOrderId": "...", "orderStatus": "EXECUTED", ...}
+        """
+        svc = await self._get_service()
+        return svc.get_equity_order_update()
 
 
 # Module-level singleton

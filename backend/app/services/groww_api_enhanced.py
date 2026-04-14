@@ -16,7 +16,7 @@ from typing import Any, Dict, List, Optional
 from growwapi import GrowwAPI
 
 from app.core.config import settings
-from app.services.groww_api import GrowwAPIClient
+from app.services.groww_api import GrowwAPIClient, GrowwFeedClient
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +55,7 @@ class GrowwService:
 
     def __init__(self):
         self.client: Optional[GrowwAPIClient] = None
+        self.feed: Optional[GrowwFeedClient] = None
         self._online = False
 
     # ------------------------------------------------------------------
@@ -62,13 +63,14 @@ class GrowwService:
     # ------------------------------------------------------------------
     async def initialise(self):
         """
-        Exchange the API key for an access token and build the SDK client.
+        Exchange the API key + secret for an access token and build the SDK client.
         Safe to call even when no credentials are configured.
         """
         api_key = settings.GROWW_API_KEY
-        if not api_key:
+        api_secret = settings.GROWW_API_SECRET
+        if not api_key or not api_secret:
             logger.warning(
-                "GROWW_API_KEY not set – Groww service running in offline mode."
+                "GROWW_API_KEY or GROWW_API_SECRET not set – Groww service running in offline mode."
             )
             return
 
@@ -76,8 +78,8 @@ class GrowwService:
         # otherwise obtain one via the SDK's get_access_token flow.
         token = getattr(settings, "GROWW_AUTH_TOKEN", "") or ""
         if not token:
-            logger.info("Fetching Groww access token via API key …")
-            token = GrowwAPIClient.get_access_token(api_key)
+            logger.info("Fetching Groww access token via API key + secret …")
+            token = GrowwAPIClient.get_access_token(api_key, api_secret)
 
         if not token:
             logger.error(
@@ -86,6 +88,7 @@ class GrowwService:
             return
 
         self.client = GrowwAPIClient(token)
+        self.feed = GrowwFeedClient(GrowwAPI(token))
         self._online = True
         logger.info("GrowwService initialised and online.")
 
@@ -149,25 +152,29 @@ class GrowwService:
     async def get_ltp(
         self,
         trading_symbol: str,
-        exchange: str = GrowwAPI.EXCHANGE_NSE,
+        exchange: str = "NSE",
         segment: str = GrowwAPI.SEGMENT_CASH,
     ) -> Optional[float]:
         """
         Return the last traded price for a single symbol.
 
+        Internally looks up the instrument, then calls the SDK's get_ltp
+        with exchange_trading_symbols="NSE_RELIANCE" and segment from instrument.
+
         Args:
             trading_symbol: e.g. "RELIANCE"
-            exchange:        GrowwAPI.EXCHANGE_NSE | EXCHANGE_BSE
-            segment:         GrowwAPI.SEGMENT_CASH | SEGMENT_FNO
+            exchange:        e.g. "NSE" or "BSE"
+            segment:         Segment string e.g. "CASH", "FNO"
         """
         if not self.is_online:
             return None
-        key = f"{exchange}:{trading_symbol}"
-        result = await self.client.get_ltp((key,), segment)
+        exchange_trading_symbol = f"{exchange}_{trading_symbol}"
+        result = await self.client.get_ltp(
+            exchange_trading_symbols=exchange_trading_symbol,
+            segment=segment
+        )
         if result:
-            # SDK returns a dict keyed by the exchange:symbol string
-            entry = result.get(key) or next(iter(result.values()), {})
-            return entry.get("ltp") or entry.get("last_price")
+            return result.get("ltp")
         return None
 
     async def get_quote(
@@ -191,7 +198,7 @@ class GrowwService:
     async def get_ohlc(
         self,
         trading_symbol: str,
-        exchange: str = GrowwAPI.EXCHANGE_NSE,
+        exchange: str = "NSE",
         segment: str = GrowwAPI.SEGMENT_CASH,
     ) -> Optional[Dict]:
         """
@@ -199,13 +206,16 @@ class GrowwService:
 
         Args:
             trading_symbol: e.g. "RELIANCE"
-            exchange:        GrowwAPI.EXCHANGE_NSE | EXCHANGE_BSE
+            exchange:        e.g. "NSE" or "BSE"
             segment:         GrowwAPI.SEGMENT_CASH | SEGMENT_FNO
         """
         if not self.is_online:
             return None
-        key = f"{exchange}:{trading_symbol}"
-        result = await self.client.get_ohlc((key,), segment)
+        key = f"{exchange}_{trading_symbol}"
+        result = await self.client.get_ohlc(
+            segment=segment,
+            exchange_trading_symbols=key
+        )
         if result:
             return result.get(key) or next(iter(result.values()), None)
         return None
@@ -235,7 +245,7 @@ class GrowwService:
         segment: str = GrowwAPI.SEGMENT_CASH,
     ) -> Optional[List[Dict]]:
         """
-        Fetch historical OHLCV candles using the correct Groww SDK method.
+        Fetch historical OHLCV candles using the Groww SDK.
 
         The SDK expects ``start_time`` / ``end_time`` as
         ``"yyyy-MM-dd HH:mm:ss"`` strings and ``interval_in_minutes`` as int.
@@ -264,7 +274,7 @@ class GrowwService:
         end_time = end_dt.strftime("%Y-%m-%d %H:%M:%S")
         start_time = start_dt.strftime("%Y-%m-%d %H:%M:%S")
 
-        raw = await self.client.get_historical_candle_data_v2(
+        raw = await self.client.get_historical_candle_data(
             trading_symbol=trading_symbol,
             exchange=exchange,
             segment=segment,
@@ -276,11 +286,30 @@ class GrowwService:
 
     def _normalise_candles(self, raw: Any) -> Optional[List[Dict]]:
         """
-        Convert SDK candle output (DataFrame or list) to list of plain dicts.
+        Convert SDK candle response to list of plain dicts.
+
+        SDK returns:
+        {"candles": [[epoch_sec, open, high, low, close, volume], ...],
+         "start_time": "...", "end_time": "...", "interval_in_minutes": 5}
         """
         if raw is None:
             return None
-        # pandas DataFrame
+        # Handle the actual SDK response format
+        if isinstance(raw, dict) and "candles" in raw:
+            candles = raw["candles"]
+            return [
+                {
+                    "timestamp": c[0],
+                    "open": c[1],
+                    "high": c[2],
+                    "low": c[3],
+                    "close": c[4],
+                    "volume": c[5],
+                }
+                for c in candles
+                if isinstance(c, (list, tuple)) and len(c) >= 6
+            ]
+        # pandas DataFrame fallback
         if hasattr(raw, "to_dict"):
             return raw.to_dict(orient="records")
         # Already a list
@@ -331,15 +360,15 @@ class GrowwService:
     async def place_order(
         self,
         trading_symbol: str,
-        transaction_type: str,
         quantity: int,
-        order_type: str = GrowwAPI.ORDER_TYPE_MARKET,
+        transaction_type: str,
+        order_type: str = GrowwAPI.ORDER_TYPE_LIMIT,
         product: str = GrowwAPI.PRODUCT_CNC,
         validity: str = GrowwAPI.VALIDITY_DAY,
-        price: float = 0.0,
-        trigger_price: Optional[float] = None,
         exchange: str = GrowwAPI.EXCHANGE_NSE,
         segment: str = GrowwAPI.SEGMENT_CASH,
+        price: Optional[float] = None,
+        trigger_price: Optional[float] = None,
         order_reference_id: Optional[str] = None,
     ) -> Optional[Dict]:
         """
@@ -348,20 +377,21 @@ class GrowwService:
         Live trading must be enabled in settings (``LIVE_TRADING_ENABLED=True``).
 
         Args:
-            trading_symbol:    e.g. "RELIANCE"
-            transaction_type:  GrowwAPI.TRANSACTION_TYPE_BUY | TRANSACTION_TYPE_SELL
+            trading_symbol:    e.g. "WIPRO"
             quantity:          Number of shares / lots
-            order_type:        GrowwAPI.ORDER_TYPE_MARKET (default) | LIMIT | SL | SL_M
+            transaction_type:  GrowwAPI.TRANSACTION_TYPE_BUY | TRANSACTION_TYPE_SELL
+            order_type:        GrowwAPI.ORDER_TYPE_LIMIT (default) | MARKET | STOP_LOSS | STOP_LOSS_MARKET
             product:           GrowwAPI.PRODUCT_CNC (default) | MIS | NRML | MTF
             validity:          GrowwAPI.VALIDITY_DAY (default) | IOC | GTC | GTD | EOS
-            price:             Limit price – required for LIMIT / SL orders; 0.0 for MARKET
-            trigger_price:     Trigger price – required for SL / SL_M orders
             exchange:          GrowwAPI.EXCHANGE_NSE (default) | EXCHANGE_BSE
             segment:           GrowwAPI.SEGMENT_CASH (default) | SEGMENT_FNO
-            order_reference_id: Optional client-side idempotency reference
+            price:             Optional: Price for LIMIT / SL orders
+            trigger_price:     Optional: Trigger price for SL / SL_M orders
+            order_reference_id: Optional: 8-20 char alphanumeric reference ID
 
         Returns:
-            SDK response dict with ``groww_order_id`` on success, or None.
+            dict e.g. {"groww_order_id": "...", "order_status": "OPEN",
+                       "order_reference_id": "...", "remark": "Order placed successfully"}
         """
         if not self.is_online:
             logger.warning("place_order: Groww service is offline.")
@@ -372,13 +402,13 @@ class GrowwService:
 
         return await self.client.place_order(
             trading_symbol=trading_symbol,
+            quantity=quantity,
+            validity=validity,
             exchange=exchange,
             segment=segment,
-            transaction_type=transaction_type,
-            quantity=quantity,
-            order_type=order_type,
             product=product,
-            validity=validity,
+            order_type=order_type,
+            transaction_type=transaction_type,
             price=price,
             trigger_price=trigger_price,
             order_reference_id=order_reference_id,
@@ -395,20 +425,25 @@ class GrowwService:
     async def modify_order(
         self,
         groww_order_id: str,
-        order_type: str,
         quantity: int,
+        order_type: str,
+        segment: str = GrowwAPI.SEGMENT_CASH,
         price: Optional[float] = None,
         trigger_price: Optional[float] = None,
-        segment: str = GrowwAPI.SEGMENT_CASH,
     ) -> Optional[Dict]:
-        """Modify quantity / price of an existing open order."""
+        """
+        Modify an existing open order.
+
+        Returns:
+            dict e.g. {"groww_order_id": "...", "order_status": "OPEN"}
+        """
         if not self.is_online:
             return None
         return await self.client.modify_order(
+            quantity=quantity,
+            order_type=order_type,
             segment=segment,
             groww_order_id=groww_order_id,
-            order_type=order_type,
-            quantity=quantity,
             price=price,
             trigger_price=trigger_price,
         )
@@ -509,17 +544,26 @@ class GrowwService:
         exchange: str = GrowwAPI.EXCHANGE_NSE,
     ) -> Optional[Dict]:
         """
-        Get option Greeks for a specific contract.
+        Get option Greeks for a specific FNO contract.
 
         Args:
             underlying:     e.g. "NIFTY"
-            trading_symbol: e.g. "NIFTY24APR22000CE"
-            expiry:         "YYYY-MM-DD"
+            trading_symbol: e.g. "NIFTY25O1425100CE"
+            expiry:         "YYYY-MM-DD" e.g. "2025-10-14"
             exchange:       GrowwAPI.EXCHANGE_NSE (default)
+
+        Returns:
+            dict e.g. {"greeks": {"delta": ..., "gamma": ..., "theta": ...,
+                       "vega": ..., "rho": ..., "iv": ...}}
         """
         if not self.is_online:
             return None
-        return await self.client.get_greeks(exchange, underlying, trading_symbol, expiry)
+        return await self.client.get_greeks(
+            exchange=exchange,
+            underlying=underlying,
+            trading_symbol=trading_symbol,
+            expiry=expiry
+        )
 
     # ------------------------------------------------------------------
     # Smart orders (GTT / OCO)
@@ -555,3 +599,171 @@ class GrowwService:
             segment=segment,
             status=status,
         )
+
+    # ------------------------------------------------------------------
+    # Live feed (GrowwFeed WebSocket)
+    # ------------------------------------------------------------------
+    def subscribe_live_ltp(
+        self,
+        instruments: List[Dict],
+        on_data_received=None,
+    ):
+        """
+        Subscribe to live LTP data for instruments.
+
+        Args:
+            instruments: List of dicts e.g.
+                [{"exchange": "NSE", "segment": "CASH", "exchange_token": "2885"}]
+            on_data_received: Optional callback triggered when data arrives
+        """
+        if not self.is_online or not self.feed:
+            logger.warning("subscribe_live_ltp: service is offline or feed not available")
+            return
+        self.feed.subscribe_ltp(instruments, on_data_received=on_data_received)
+
+    def unsubscribe_live_ltp(self, instruments: List[Dict]):
+        """Unsubscribe from live LTP for instruments."""
+        if not self.feed:
+            return
+        self.feed.unsubscribe_ltp(instruments)
+
+    def get_live_ltp(self) -> Optional[Dict]:
+        """
+        Poll the latest live LTP data.
+
+        Returns:
+            dict e.g.
+            {"ltp": {"NSE": {"CASH": {"2885": {"tsInMillis": ..., "ltp": 1419.1}}}}}
+        """
+        if not self.feed:
+            return None
+        return self.feed.get_ltp()
+
+    async def start_live_feed(self):
+        """Start the live feed consumer in a background thread."""
+        if not self.is_online or not self.feed:
+            logger.warning("start_live_feed: service is offline or feed not available")
+            return
+        await self.feed.start()
+
+    def stop_live_feed(self):
+        """Stop the live feed and unsubscribe all."""
+        if self.feed:
+            self.feed.stop()
+
+    # ------------------------------------------------------------------
+    # Live feed — Index values
+    # ------------------------------------------------------------------
+    def subscribe_live_index_value(
+        self,
+        instruments: List[Dict],
+        on_data_received=None,
+    ):
+        """
+        Subscribe to live index values.
+
+        Args:
+            instruments: List of dicts e.g.
+                [{"exchange": "NSE", "segment": "CASH", "exchange_token": "NIFTY"},
+                 {"exchange": "BSE", "segment": "CASH", "exchange_token": "1"}]
+            on_data_received: Optional callback triggered when data arrives
+        """
+        if not self.is_online or not self.feed:
+            logger.warning("subscribe_live_index_value: service is offline or feed not available")
+            return
+        self.feed.subscribe_index_value(instruments, on_data_received=on_data_received)
+
+    def unsubscribe_live_index_value(self, instruments: List[Dict]):
+        """Unsubscribe from live index values."""
+        if not self.feed:
+            return
+        self.feed.unsubscribe_index_value(instruments)
+
+    def get_live_index_value(self) -> Optional[Dict]:
+        """
+        Poll the latest live index values.
+
+        Returns:
+            dict e.g.
+            {"NSE": {"CASH": {"NIFTY": {"tsInMillis": ..., "value": 24386.7}}},
+             "BSE": {"CASH": {"1": {"tsInMillis": ..., "value": 73386.7}}}}
+        """
+        if not self.feed:
+            return None
+        return self.feed.get_index_value()
+
+    # ------------------------------------------------------------------
+    # Live feed — FNO order updates
+    # ------------------------------------------------------------------
+    def subscribe_fno_order_updates(self, on_data_received=None):
+        """
+        Subscribe to derivative (FNO) order updates.
+
+        Args:
+            on_data_received: Optional callback. Receives meta dict with
+                              "feed_type" and "segment" keys.
+        """
+        if not self.is_online or not self.feed:
+            logger.warning("subscribe_fno_order_updates: service is offline or feed not available")
+            return
+        self.feed.subscribe_fno_order_updates(on_data_received=on_data_received)
+
+    def unsubscribe_fno_order_updates(self):
+        """Unsubscribe from FNO order updates."""
+        if not self.feed:
+            return
+        self.feed.unsubscribe_fno_order_updates()
+
+    def get_fno_order_update(self) -> Optional[Dict]:
+        """
+        Poll the latest FNO order update.
+
+        Returns:
+            dict e.g.
+            {"qty": 75, "price": "130", "filledQty": 75, "avgFillPrice": "110",
+             "growwOrderId": "...", "exchangeOrderId": "...",
+             "orderStatus": "EXECUTED", "duration": "DAY",
+             "exchange": "NSE", "segment": "FNO", "product": "NRML",
+             "contractId": "NIFTY2522025400CE"}
+        """
+        if not self.feed:
+            return None
+        return self.feed.get_fno_order_update()
+
+    # ------------------------------------------------------------------
+    # Live feed — Equity order updates
+    # ------------------------------------------------------------------
+    def subscribe_equity_order_updates(self, on_data_received=None):
+        """
+        Subscribe to equity (CASH segment) order updates.
+
+        Args:
+            on_data_received: Optional callback. Receives meta dict with
+                              "feed_type" and "segment" keys.
+        """
+        if not self.is_online or not self.feed:
+            logger.warning("subscribe_equity_order_updates: service is offline or feed not available")
+            return
+        self.feed.subscribe_equity_order_updates(on_data_received=on_data_received)
+
+    def unsubscribe_equity_order_updates(self):
+        """Unsubscribe from equity order updates."""
+        if not self.feed:
+            return
+        self.feed.unsubscribe_equity_order_updates()
+
+    def get_equity_order_update(self) -> Optional[Dict]:
+        """
+        Poll the latest equity order update.
+
+        Returns:
+            dict e.g.
+            {"qty": 3, "filledQty": 3, "avgFillPrice": "145",
+             "growwOrderId": "...", "exchangeOrderId": "...",
+             "orderStatus": "EXECUTED", "duration": "DAY",
+             "exchange": "NSE", "contractId": "INE221H01019"}
+        """
+        if not self.feed:
+            return None
+        return self.feed.get_equity_order_update()
+

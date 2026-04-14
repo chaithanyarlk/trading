@@ -208,7 +208,7 @@ async def execute_decision(decision: ChiefDecision) -> Dict:
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# ═══════════════════════════════════════════════════════════════════════
+# ═════��═════════════════════════════════════════════════════════════════
 #  PORTFOLIO & PERFORMANCE
 # ═══════════════════════════════════════════════════════════════════════
 
@@ -616,3 +616,210 @@ async def generate_eod_report_now() -> Dict:
     await auto_scheduler._generate_eod_report()
     report = auto_scheduler.get_eod_report()
     return {"available": True, "report": report}
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  LIVE FEED — subscribe / poll / unsubscribe real-time LTP
+# ═══════════════════════════════════════════════════════════════════════
+
+@agent_router.post("/live-feed/subscribe")
+async def subscribe_live_feed(instruments: List[Dict]) -> Dict:
+    """
+    Subscribe to live LTP for instruments.
+
+    Body: list of dicts e.g.
+    [{"exchange": "NSE", "segment": "CASH", "exchange_token": "2885"}]
+    """
+    try:
+        await groww_data.subscribe_live_ltp(instruments)
+        await groww_data.start_live_feed()
+        return {"subscribed": True, "instruments": len(instruments)}
+    except Exception as e:
+        logger.error(f"Error subscribing to live feed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@agent_router.get("/live-feed/ltp")
+async def get_live_ltp() -> Dict:
+    """Poll the latest live LTP data."""
+    try:
+        data = await groww_data.get_live_ltp()
+        if data is None:
+            return {"online": False, "message": "Live feed not active"}
+        return {"online": True, "data": data}
+    except Exception as e:
+        logger.error(f"Error fetching live LTP: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@agent_router.post("/live-feed/unsubscribe")
+async def unsubscribe_live_feed(instruments: List[Dict]) -> Dict:
+    """Unsubscribe from live LTP for instruments."""
+    try:
+        await groww_data.unsubscribe_live_ltp(instruments)
+        return {"unsubscribed": True, "instruments": len(instruments)}
+    except Exception as e:
+        logger.error(f"Error unsubscribing from live feed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@agent_router.post("/live-feed/stop")
+async def stop_live_feed() -> Dict:
+    """Stop the live feed entirely."""
+    try:
+        await groww_data.stop_live_feed()
+        return {"stopped": True}
+    except Exception as e:
+        logger.error(f"Error stopping live feed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  LIVE INDEX VALUES — subscribe / poll / unsubscribe real-time indices
+# ═══════════════════════════════════════════════════════════════════════
+
+@agent_router.post("/live-feed/index/subscribe")
+async def subscribe_index_feed(instruments: List[Dict]) -> Dict:
+    """
+    Subscribe to live index values.
+
+    Body: list of dicts e.g.
+    [{"exchange": "NSE", "segment": "CASH", "exchange_token": "NIFTY"},
+     {"exchange": "BSE", "segment": "CASH", "exchange_token": "1"}]
+    """
+    try:
+        await groww_data.subscribe_live_index_value(instruments)
+        await groww_data.start_live_feed()
+        return {"subscribed": True, "indices": len(instruments)}
+    except Exception as e:
+        logger.error(f"Error subscribing to index feed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@agent_router.get("/live-feed/index/value")
+async def get_live_index_value() -> Dict:
+    """
+    Poll the latest live index values.
+
+    Returns e.g.
+    {"NSE": {"CASH": {"NIFTY": {"tsInMillis": ..., "value": 24386.7}}}}
+    """
+    try:
+        data = await groww_data.get_live_index_value()
+        if data is None:
+            return {"online": False, "message": "Index feed not active"}
+        return {"online": True, "data": data}
+    except Exception as e:
+        logger.error(f"Error fetching live index value: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@agent_router.post("/live-feed/index/unsubscribe")
+async def unsubscribe_index_feed(instruments: List[Dict]) -> Dict:
+    """Unsubscribe from live index values."""
+    try:
+        await groww_data.unsubscribe_live_index_value(instruments)
+        return {"unsubscribed": True, "indices": len(instruments)}
+    except Exception as e:
+        logger.error(f"Error unsubscribing from index feed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  FNO ORDER UPDATES — subscribe / poll / unsubscribe derivative orders
+# ═══════════════════════════════════════════════════════════════════════
+
+@agent_router.post("/live-feed/fno-orders/subscribe")
+async def subscribe_fno_order_updates() -> Dict:
+    """
+    Subscribe to derivative (FNO) order updates.
+    Receive real-time updates when FNO orders are placed/executed/cancelled.
+    """
+    try:
+        await groww_data.subscribe_fno_order_updates()
+        await groww_data.start_live_feed()
+        return {"subscribed": True}
+    except Exception as e:
+        logger.error(f"Error subscribing to FNO order updates: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@agent_router.get("/live-feed/fno-orders/update")
+async def get_fno_order_update() -> Dict:
+    """
+    Poll the latest FNO order update.
+
+    Returns e.g.
+    {"qty": 75, "price": "130", "filledQty": 75, "avgFillPrice": "110",
+     "growwOrderId": "...", "orderStatus": "EXECUTED", "segment": "FNO", ...}
+    """
+    try:
+        data = await groww_data.get_fno_order_update()
+        if data is None:
+            return {"online": False, "message": "FNO order updates not active"}
+        return {"online": True, "data": data}
+    except Exception as e:
+        logger.error(f"Error fetching FNO order update: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@agent_router.post("/live-feed/fno-orders/unsubscribe")
+async def unsubscribe_fno_order_updates() -> Dict:
+    """Unsubscribe from FNO order updates."""
+    try:
+        await groww_data.unsubscribe_fno_order_updates()
+        return {"unsubscribed": True}
+    except Exception as e:
+        logger.error(f"Error unsubscribing from FNO order updates: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  EQUITY ORDER UPDATES — subscribe / poll / unsubscribe equity orders
+# ═══════════════════════════════════════════════════════════════════════
+
+@agent_router.post("/live-feed/equity-orders/subscribe")
+async def subscribe_equity_order_updates() -> Dict:
+    """
+    Subscribe to equity (CASH segment) order updates.
+    Receive real-time updates when equity orders are placed/executed/cancelled.
+    """
+    try:
+        await groww_data.subscribe_equity_order_updates()
+        await groww_data.start_live_feed()
+        return {"subscribed": True}
+    except Exception as e:
+        logger.error(f"Error subscribing to equity order updates: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@agent_router.get("/live-feed/equity-orders/update")
+async def get_equity_order_update() -> Dict:
+    """
+    Poll the latest equity order update.
+
+    Returns e.g.
+    {"qty": 3, "filledQty": 3, "avgFillPrice": "145",
+     "growwOrderId": "...", "orderStatus": "EXECUTED", "exchange": "NSE", ...}
+    """
+    try:
+        data = await groww_data.get_equity_order_update()
+        if data is None:
+            return {"online": False, "message": "Equity order updates not active"}
+        return {"online": True, "data": data}
+    except Exception as e:
+        logger.error(f"Error fetching equity order update: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@agent_router.post("/live-feed/equity-orders/unsubscribe")
+async def unsubscribe_equity_order_updates() -> Dict:
+    """Unsubscribe from equity order updates."""
+    try:
+        await groww_data.unsubscribe_equity_order_updates()
+        return {"unsubscribed": True}
+    except Exception as e:
+        logger.error(f"Error unsubscribing from equity order updates: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
